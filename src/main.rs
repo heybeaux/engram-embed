@@ -17,8 +17,9 @@ use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 mod embedder;
+mod nomic_bert;
 
-use embedder::{EmbedResult, ModelId, ModelRegistry};
+use embedder::{ModelId, ModelRegistry};
 
 // ============================================================================
 // Types (OpenAI-compatible + Extensions)
@@ -91,6 +92,7 @@ struct Timing {
 struct HealthResponse {
     status: String,
     models: Vec<ModelStatus>,
+    loaded_count: usize,
     version: String,
 }
 
@@ -98,6 +100,8 @@ struct HealthResponse {
 struct ModelStatus {
     id: String,
     dimensions: usize,
+    max_tokens: usize,
+    loaded: bool,
     default: bool,
 }
 
@@ -114,19 +118,23 @@ struct AppState {
 // ============================================================================
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
-    let models = state.registry.loaded_models();
-    let default_model = models.first().copied().unwrap_or(ModelId::BgeBase);
+    let enabled = state.registry.enabled_models();
+    let loaded = state.registry.loaded_models();
+    let default_model = enabled.first().copied().unwrap_or(ModelId::BgeBase);
 
     Json(HealthResponse {
         status: "ok".to_string(),
-        models: models
-            .into_iter()
-            .map(|m| ModelStatus {
+        models: enabled
+            .iter()
+            .map(|&m| ModelStatus {
                 id: m.display_name().to_string(),
                 dimensions: m.dimensions(),
+                max_tokens: m.max_tokens(),
+                loaded: loaded.contains(&m),
                 default: m == default_model,
             })
             .collect(),
+        loaded_count: loaded.len(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
 }
@@ -214,9 +222,10 @@ async fn embed(
 
 /// List available models
 async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let loaded = state.registry.loaded_models();
     let models: Vec<serde_json::Value> = state
         .registry
-        .loaded_models()
+        .enabled_models()
         .into_iter()
         .map(|m| {
             serde_json::json!({
@@ -225,6 +234,8 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
                 "created": 0,
                 "owned_by": "engram-embed",
                 "dimensions": m.dimensions(),
+                "max_tokens": m.max_tokens(),
+                "loaded": loaded.contains(&m),
             })
         })
         .collect();
@@ -249,12 +260,18 @@ async fn main() -> Result<()> {
 
     info!("🚀 engram-embed v{} starting...", env!("CARGO_PKG_VERSION"));
 
-    // Determine which models to load from env
+    // Determine which models to enable from env
+    // Use "*" or "all" for all models, or comma-separated list
     let models_env = std::env::var("EMBED_MODELS").unwrap_or_else(|_| "bge-base".to_string());
-    let model_ids: Vec<ModelId> = models_env
-        .split(',')
-        .filter_map(|s| ModelId::from_str(s.trim()))
-        .collect();
+    
+    let model_ids: Vec<ModelId> = if models_env == "*" || models_env.to_lowercase() == "all" {
+        ModelId::all().to_vec()
+    } else {
+        models_env
+            .split(',')
+            .filter_map(|s| ModelId::from_str(s.trim()))
+            .collect()
+    };
 
     let model_ids = if model_ids.is_empty() {
         vec![ModelId::BgeBase]
@@ -262,15 +279,8 @@ async fn main() -> Result<()> {
         model_ids
     };
 
-    info!(
-        "📦 Loading {} model(s): {:?}",
-        model_ids.len(),
-        model_ids.iter().map(|m| m.display_name()).collect::<Vec<_>>()
-    );
-
-    // Load models
+    // Create registry (lazy loading - models loaded on first request)
     let registry = ModelRegistry::new(&model_ids)?;
-    info!("✅ All models loaded successfully");
 
     // Create app state
     let state = Arc::new(AppState { registry });
@@ -288,10 +298,17 @@ async fn main() -> Result<()> {
     info!("🌐 Listening on http://{}", addr);
     info!("📡 POST /v1/embeddings - OpenAI-compatible endpoint");
     info!("📡 GET  /v1/models     - List available models");
+    info!("📡 GET  /health        - Health check with model status");
+    info!("");
+    info!("Available models:");
+    for m in &model_ids {
+        info!("  - {} ({}-dim, max {} tokens)", m.display_name(), m.dimensions(), m.max_tokens());
+    }
     info!("");
     info!("Usage:");
     info!("  Single model:  {{ \"input\": \"text\", \"model\": \"bge-base\" }}");
     info!("  All models:    {{ \"input\": \"text\", \"model\": \"*\" }}");
+    info!("💤 Models loaded lazily on first request");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;

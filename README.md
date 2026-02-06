@@ -2,6 +2,8 @@
 
 Local embedding server in Rust — drop-in replacement for OpenAI's embeddings API.
 
+**Ecosystem:** [Core API](https://github.com/heybeaux/engram) • [Dashboard](https://github.com/heybeaux/engram-dashboard) • [Local Embeddings](https://github.com/heybeaux/engram-embed)
+
 ## Why?
 
 | OpenAI | engram-embed |

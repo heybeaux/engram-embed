@@ -28,11 +28,18 @@ serde_json = "1"
 # Utilities
 anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 hf-hub = "0.4"  # Download models from HuggingFace
+
+# System info (memory usage)
+libc = "0.2"
 
 # Metal acceleration (macOS) - enabled via candle-core feature
 # Note: Metal support is built into candle-core with the "metal" feature
+
+[dev-dependencies]
+reqwest = { version = "0.11", features = ["json"] }
+tokio-test = "0.4"
 
 [profile.release]
 opt-level = 3

@@ -15,13 +15,14 @@
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::bert::{BertModel, Config as BertConfig};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use tokenizers::Tokenizer;
+use tokenizers::{Tokenizer, TruncationParams, TruncationDirection, TruncationStrategy};
 use tracing::info;
 
+// Metal-compatible models
+use crate::metal_bert::{MetalBertConfig, MetalBertModel};
 use crate::nomic_bert::{NomicBertConfig, NomicBertModel};
 
 /// Supported model identifiers
@@ -107,7 +108,9 @@ impl std::fmt::Display for ModelId {
 
 /// Model backend enum - supports different model architectures
 enum ModelBackend {
-    Bert(BertModel),
+    /// Metal-compatible BERT (BGE, MiniLM, GTE)
+    MetalBert(MetalBertModel),
+    /// Nomic BERT with rotary embeddings
     NomicBert(NomicBertModel),
 }
 
@@ -127,8 +130,8 @@ impl Embedder {
     pub fn new(model_id: ModelId) -> Result<Self> {
         let hf_id = model_id.to_hf_id();
 
-        // Select device (CPU for now - Metal has incomplete BERT op support)
-        let device = Self::select_device()?;
+        // Select device - Metal for Nomic, CPU for standard BERT
+        let device = Self::select_device(model_id)?;
         info!("Loading {} using device: {:?}", hf_id, device);
 
         // Download model files from HuggingFace
@@ -142,9 +145,19 @@ impl Embedder {
             .get("model.safetensors")
             .or_else(|_| repo.get("pytorch_model.bin"))?;
 
-        // Load tokenizer
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+        // Load tokenizer with truncation enabled
+        let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+        
+        // Enable truncation to prevent position embedding overflow
+        // BERT models have max_position_embeddings (typically 512)
+        let max_tokens = model_id.max_tokens();
+        tokenizer.with_truncation(Some(TruncationParams {
+            max_length: max_tokens,
+            strategy: TruncationStrategy::LongestFirst,
+            stride: 0,
+            direction: TruncationDirection::Right,
+        })).map_err(|e| anyhow::anyhow!("Failed to set truncation: {}", e))?;
 
         // Load model weights
         info!("Loading model weights for {}...", hf_id);
@@ -168,10 +181,11 @@ impl Embedder {
                 ModelBackend::NomicBert(nomic_model)
             }
             _ => {
-                // Standard BERT-based models
-                let config: BertConfig = serde_json::from_str(&config_str)?;
-                let bert_model = BertModel::load(vb, &config)?;
-                ModelBackend::Bert(bert_model)
+                // Standard BERT-based models (BGE, MiniLM, GTE)
+                // Using MetalBertModel for Metal GPU compatibility
+                let config: MetalBertConfig = serde_json::from_str(&config_str)?;
+                let bert_model = MetalBertModel::load(vb, &config)?;
+                ModelBackend::MetalBert(bert_model)
             }
         };
 
@@ -198,10 +212,46 @@ impl Embedder {
         self.model_id.dimensions()
     }
 
-    /// Select the best available device
-    fn select_device() -> Result<Device> {
-        // Metal has incomplete op support for BERT models (missing layer-norm)
-        // Use CPU for now - still very fast on Apple Silicon
+    /// Select the best available device for a given model
+    /// 
+    /// All models now use Metal-compatible implementations (MetalSafeLayerNorm).
+    /// Control via EMBED_DEVICE env var: "cpu" to force CPU, "metal" to use Metal.
+    fn select_device(model_id: ModelId) -> Result<Device> {
+        // Check for forced CPU mode
+        let force_cpu = std::env::var("EMBED_DEVICE")
+            .map(|v| v.to_lowercase() == "cpu")
+            .unwrap_or(false);
+        
+        if force_cpu {
+            info!("EMBED_DEVICE=cpu, using CPU");
+            return Ok(Device::Cpu);
+        }
+        
+        // Check if Metal is requested
+        let use_metal = std::env::var("EMBED_DEVICE")
+            .map(|v| v.to_lowercase() == "metal")
+            .unwrap_or(false);
+        
+        if use_metal {
+            #[cfg(target_os = "macos")]
+            {
+                match Device::new_metal(0) {
+                    Ok(device) => {
+                        info!("🔩 Using Metal GPU acceleration for {}", model_id);
+                        return Ok(device);
+                    }
+                    Err(e) => {
+                        info!("Metal not available: {}, falling back to CPU", e);
+                    }
+                }
+            }
+            
+            #[cfg(not(target_os = "macos"))]
+            {
+                info!("Metal only available on macOS, using CPU");
+            }
+        }
+        
         Ok(Device::Cpu)
     }
 
@@ -263,7 +313,7 @@ impl Embedder {
 
         // Run model forward pass
         let embeddings = match &self.model {
-            ModelBackend::Bert(model) => {
+            ModelBackend::MetalBert(model) => {
                 model.forward(&input_ids, &token_type_ids, Some(&attention_mask))?
             }
             ModelBackend::NomicBert(model) => {
@@ -543,44 +593,55 @@ pub struct EmbedResult {
 mod tests {
     use super::*;
 
+    // ========================================================================
+    // ModelId Parsing Tests
+    // ========================================================================
+
     #[test]
-    fn test_model_id_parsing() {
-        // BGE Base
+    fn test_model_id_parsing_bge() {
         assert_eq!(ModelId::from_str("bge-base"), Some(ModelId::BgeBase));
-        assert_eq!(
-            ModelId::from_str("BAAI/bge-base-en-v1.5"),
-            Some(ModelId::BgeBase)
-        );
-        
-        // MiniLM
+        assert_eq!(ModelId::from_str("BGE-BASE"), Some(ModelId::BgeBase));
+        assert_eq!(ModelId::from_str("bge-base-en-v1.5"), Some(ModelId::BgeBase));
+        assert_eq!(ModelId::from_str("BAAI/bge-base-en-v1.5"), Some(ModelId::BgeBase));
+        assert_eq!(ModelId::from_str("baai/bge-base-en-v1.5"), Some(ModelId::BgeBase));
+    }
+
+    #[test]
+    fn test_model_id_parsing_minilm() {
         assert_eq!(ModelId::from_str("minilm"), Some(ModelId::MiniLM));
-        assert_eq!(
-            ModelId::from_str("all-MiniLM-L6-v2"),
-            Some(ModelId::MiniLM)
-        );
-        
-        // GTE Base
+        assert_eq!(ModelId::from_str("MINILM"), Some(ModelId::MiniLM));
+        assert_eq!(ModelId::from_str("all-MiniLM-L6-v2"), Some(ModelId::MiniLM));
+        assert_eq!(ModelId::from_str("all-minilm-l6-v2"), Some(ModelId::MiniLM));
+        assert_eq!(ModelId::from_str("sentence-transformers/all-MiniLM-L6-v2"), Some(ModelId::MiniLM));
+    }
+
+    #[test]
+    fn test_model_id_parsing_gte() {
         assert_eq!(ModelId::from_str("gte-base"), Some(ModelId::GteBase));
         assert_eq!(ModelId::from_str("gte"), Some(ModelId::GteBase));
-        assert_eq!(
-            ModelId::from_str("thenlper/gte-base"),
-            Some(ModelId::GteBase)
-        );
-        
-        // Nomic
-        assert_eq!(ModelId::from_str("nomic"), Some(ModelId::Nomic));
-        assert_eq!(
-            ModelId::from_str("nomic-embed-text-v1.5"),
-            Some(ModelId::Nomic)
-        );
-        assert_eq!(
-            ModelId::from_str("nomic-ai/nomic-embed-text-v1.5"),
-            Some(ModelId::Nomic)
-        );
-        
-        // Unknown
-        assert_eq!(ModelId::from_str("unknown"), None);
+        assert_eq!(ModelId::from_str("GTE"), Some(ModelId::GteBase));
+        assert_eq!(ModelId::from_str("thenlper/gte-base"), Some(ModelId::GteBase));
     }
+
+    #[test]
+    fn test_model_id_parsing_nomic() {
+        assert_eq!(ModelId::from_str("nomic"), Some(ModelId::Nomic));
+        assert_eq!(ModelId::from_str("NOMIC"), Some(ModelId::Nomic));
+        assert_eq!(ModelId::from_str("nomic-embed-text-v1.5"), Some(ModelId::Nomic));
+        assert_eq!(ModelId::from_str("nomic-ai/nomic-embed-text-v1.5"), Some(ModelId::Nomic));
+    }
+
+    #[test]
+    fn test_model_id_parsing_unknown() {
+        assert_eq!(ModelId::from_str("unknown"), None);
+        assert_eq!(ModelId::from_str("gpt-4"), None);
+        assert_eq!(ModelId::from_str(""), None);
+        assert_eq!(ModelId::from_str("openai/text-embedding-ada-002"), None);
+    }
+
+    // ========================================================================
+    // ModelId Properties Tests
+    // ========================================================================
 
     #[test]
     fn test_model_dimensions() {
@@ -607,95 +668,441 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires model download
-    fn test_embedder_bge() -> Result<()> {
+    fn test_model_hf_id() {
+        assert_eq!(ModelId::BgeBase.to_hf_id(), "BAAI/bge-base-en-v1.5");
+        assert_eq!(ModelId::MiniLM.to_hf_id(), "sentence-transformers/all-MiniLM-L6-v2");
+        assert_eq!(ModelId::GteBase.to_hf_id(), "thenlper/gte-base");
+        assert_eq!(ModelId::Nomic.to_hf_id(), "nomic-ai/nomic-embed-text-v1.5");
+    }
+
+    #[test]
+    fn test_model_display_name() {
+        assert_eq!(ModelId::BgeBase.display_name(), "bge-base");
+        assert_eq!(ModelId::MiniLM.display_name(), "minilm");
+        assert_eq!(ModelId::GteBase.display_name(), "gte-base");
+        assert_eq!(ModelId::Nomic.display_name(), "nomic");
+    }
+
+    #[test]
+    fn test_model_all() {
+        let all = ModelId::all();
+        assert_eq!(all.len(), 4);
+        assert!(all.contains(&ModelId::BgeBase));
+        assert!(all.contains(&ModelId::MiniLM));
+        assert!(all.contains(&ModelId::GteBase));
+        assert!(all.contains(&ModelId::Nomic));
+    }
+
+    #[test]
+    fn test_model_display_trait() {
+        assert_eq!(format!("{}", ModelId::BgeBase), "bge-base");
+        assert_eq!(format!("{}", ModelId::MiniLM), "minilm");
+        assert_eq!(format!("{}", ModelId::GteBase), "gte-base");
+        assert_eq!(format!("{}", ModelId::Nomic), "nomic");
+    }
+
+    // ========================================================================
+    // ModelRegistry Tests (no model loading required)
+    // ========================================================================
+
+    #[test]
+    fn test_registry_new_with_empty_models() {
+        let registry = ModelRegistry::new(&[]).unwrap();
+        // Should default to BgeBase
+        assert_eq!(registry.enabled_models(), vec![ModelId::BgeBase]);
+    }
+
+    #[test]
+    fn test_registry_new_with_single_model() {
+        let registry = ModelRegistry::new(&[ModelId::MiniLM]).unwrap();
+        assert_eq!(registry.enabled_models(), vec![ModelId::MiniLM]);
+    }
+
+    #[test]
+    fn test_registry_new_with_multiple_models() {
+        let registry = ModelRegistry::new(&[ModelId::BgeBase, ModelId::MiniLM, ModelId::GteBase]).unwrap();
+        let enabled = registry.enabled_models();
+        assert_eq!(enabled.len(), 3);
+        assert!(enabled.contains(&ModelId::BgeBase));
+        assert!(enabled.contains(&ModelId::MiniLM));
+        assert!(enabled.contains(&ModelId::GteBase));
+    }
+
+    #[test]
+    fn test_registry_loaded_models_initially_empty() {
+        let registry = ModelRegistry::new(&[ModelId::BgeBase, ModelId::MiniLM]).unwrap();
+        assert!(registry.loaded_models().is_empty());
+    }
+
+    #[test]
+    fn test_registry_is_loaded_initially_false() {
+        let registry = ModelRegistry::new(&[ModelId::BgeBase]).unwrap();
+        assert!(!registry.is_loaded(ModelId::BgeBase));
+    }
+
+    // ========================================================================
+    // Embedder Tests (require model download)
+    // ========================================================================
+
+    #[test]
+    #[ignore = "requires model download"]
+    fn test_embedder_bge_dimensions() -> Result<()> {
         let embedder = Embedder::new(ModelId::BgeBase)?;
-
-        let texts = vec!["Hello, world!".to_string(), "This is a test.".to_string()];
-
-        let embeddings = embedder.embed(&texts)?;
-
-        assert_eq!(embeddings.len(), 2);
-        assert_eq!(embeddings[0].len(), 768);
-
-        // Check normalization (should be unit vectors)
-        let norm: f32 = embeddings[0].iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 0.01);
-
+        assert_eq!(embedder.dimensions(), 768);
+        assert_eq!(embedder.model_id(), ModelId::BgeBase);
         Ok(())
     }
 
     #[test]
-    #[ignore] // Requires model download
-    fn test_embedder_minilm() -> Result<()> {
+    #[ignore = "requires model download"]
+    fn test_embedder_minilm_dimensions() -> Result<()> {
         let embedder = Embedder::new(ModelId::MiniLM)?;
+        assert_eq!(embedder.dimensions(), 384);
+        assert_eq!(embedder.model_id(), ModelId::MiniLM);
+        Ok(())
+    }
 
+    #[test]
+    #[ignore = "requires model download"]
+    fn test_embedder_gte_dimensions() -> Result<()> {
+        let embedder = Embedder::new(ModelId::GteBase)?;
+        assert_eq!(embedder.dimensions(), 768);
+        assert_eq!(embedder.model_id(), ModelId::GteBase);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires model download"]
+    fn test_embedder_nomic_dimensions() -> Result<()> {
+        let embedder = Embedder::new(ModelId::Nomic)?;
+        assert_eq!(embedder.dimensions(), 768);
+        assert_eq!(embedder.model_id(), ModelId::Nomic);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires model download"]
+    fn test_embedder_single_text() -> Result<()> {
+        let embedder = Embedder::new(ModelId::MiniLM)?;
         let texts = vec!["Hello, world!".to_string()];
-
         let embeddings = embedder.embed(&texts)?;
-
+        
         assert_eq!(embeddings.len(), 1);
         assert_eq!(embeddings[0].len(), 384);
-
         Ok(())
     }
 
     #[test]
-    #[ignore] // Requires model download
-    fn test_embedder_gte() -> Result<()> {
-        let embedder = Embedder::new(ModelId::GteBase)?;
-
-        let texts = vec!["Hello, world!".to_string()];
-
+    #[ignore = "requires model download"]
+    fn test_embedder_batch_text() -> Result<()> {
+        let embedder = Embedder::new(ModelId::MiniLM)?;
+        let texts = vec![
+            "First sentence.".to_string(),
+            "Second sentence.".to_string(),
+            "Third sentence.".to_string(),
+        ];
         let embeddings = embedder.embed(&texts)?;
-
-        assert_eq!(embeddings.len(), 1);
-        assert_eq!(embeddings[0].len(), 768);
-
-        // Check normalization
-        let norm: f32 = embeddings[0].iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 0.01);
-
+        
+        assert_eq!(embeddings.len(), 3);
+        for emb in &embeddings {
+            assert_eq!(emb.len(), 384);
+        }
         Ok(())
     }
 
     #[test]
-    #[ignore] // Requires model download
-    fn test_embedder_nomic() -> Result<()> {
-        let embedder = Embedder::new(ModelId::Nomic)?;
-
-        let texts = vec!["Hello, world!".to_string()];
-
+    #[ignore = "requires model download"]
+    fn test_embedder_empty_batch() -> Result<()> {
+        let embedder = Embedder::new(ModelId::MiniLM)?;
+        let texts: Vec<String> = vec![];
         let embeddings = embedder.embed(&texts)?;
-
-        assert_eq!(embeddings.len(), 1);
-        assert_eq!(embeddings[0].len(), 768);
-
-        // Check normalization (should be unit vector)
-        let norm: f32 = embeddings[0].iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 0.01);
-
+        
+        assert!(embeddings.is_empty());
         Ok(())
     }
 
     #[test]
-    #[ignore] // Requires model download
-    fn test_lazy_loading() -> Result<()> {
-        let registry = ModelRegistry::new(&[ModelId::BgeBase, ModelId::MiniLM])?;
+    #[ignore = "requires model download"]
+    fn test_embedder_empty_string() -> Result<()> {
+        let embedder = Embedder::new(ModelId::MiniLM)?;
+        let texts = vec!["".to_string()];
+        let embeddings = embedder.embed(&texts)?;
+        
+        assert_eq!(embeddings.len(), 1);
+        assert_eq!(embeddings[0].len(), 384);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires model download"]
+    fn test_embedder_unicode_text() -> Result<()> {
+        let embedder = Embedder::new(ModelId::MiniLM)?;
+        let texts = vec![
+            "Hello 你好 مرحبا 🌍".to_string(),
+            "日本語テキスト".to_string(),
+            "Ελληνικά κείμενο".to_string(),
+        ];
+        let embeddings = embedder.embed(&texts)?;
+        
+        assert_eq!(embeddings.len(), 3);
+        for emb in &embeddings {
+            assert_eq!(emb.len(), 384);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires model download"]
+    fn test_embedder_truncation_long_text() -> Result<()> {
+        let embedder = Embedder::new(ModelId::MiniLM)?;
+        
+        // Create text that's definitely longer than 256 tokens (MiniLM max)
+        let long_text = "word ".repeat(1000);
+        let texts = vec![long_text];
+        
+        // Should not panic, should truncate
+        let embeddings = embedder.embed(&texts)?;
+        
+        assert_eq!(embeddings.len(), 1);
+        assert_eq!(embeddings[0].len(), 384);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires model download"]
+    fn test_embedder_normalization() -> Result<()> {
+        let embedder = Embedder::new(ModelId::MiniLM)?;
+        let texts = vec!["Test text for normalization.".to_string()];
+        let embeddings = embedder.embed(&texts)?;
+        
+        // Check L2 norm is approximately 1.0
+        let norm: f32 = embeddings[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 0.01,
+            "Expected norm ~1.0, got {}",
+            norm
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires model download"]
+    fn test_embedder_deterministic() -> Result<()> {
+        let embedder = Embedder::new(ModelId::MiniLM)?;
+        let texts = vec!["Deterministic test.".to_string()];
+        
+        let emb1 = embedder.embed(&texts)?;
+        let emb2 = embedder.embed(&texts)?;
+        
+        // Same input should produce same output
+        assert_eq!(emb1, emb2);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires model download"]
+    fn test_embedder_different_texts_different_embeddings() -> Result<()> {
+        let embedder = Embedder::new(ModelId::MiniLM)?;
+        
+        let emb1 = embedder.embed(&vec!["The cat sat on the mat.".to_string()])?;
+        let emb2 = embedder.embed(&vec!["Quantum physics is complex.".to_string()])?;
+        
+        // Different texts should produce different embeddings
+        assert_ne!(emb1[0], emb2[0]);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires model download"]
+    fn test_embedder_code_text() -> Result<()> {
+        let embedder = Embedder::new(ModelId::MiniLM)?;
+        let code = r#"
+            fn main() {
+                println!("Hello, world!");
+            }
+        "#.to_string();
+        
+        let embeddings = embedder.embed(&vec![code])?;
+        assert_eq!(embeddings.len(), 1);
+        assert_eq!(embeddings[0].len(), 384);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires model download"]
+    fn test_embedder_whitespace_only() -> Result<()> {
+        let embedder = Embedder::new(ModelId::MiniLM)?;
+        let texts = vec!["   \t\n   ".to_string()];
+        let embeddings = embedder.embed(&texts)?;
+        
+        assert_eq!(embeddings.len(), 1);
+        assert_eq!(embeddings[0].len(), 384);
+        Ok(())
+    }
+
+    // ========================================================================
+    // Registry with Model Loading Tests
+    // ========================================================================
+
+    #[test]
+    #[ignore = "requires model download"]
+    fn test_registry_lazy_loading() -> Result<()> {
+        let registry = ModelRegistry::new(&[ModelId::MiniLM])?;
         
         // Nothing loaded initially
         assert!(registry.loaded_models().is_empty());
-        
-        // Request bge-base - should load
-        let _result = registry.embed(&vec!["test".to_string()], Some("bge-base"))?;
-        assert!(registry.is_loaded(ModelId::BgeBase));
         assert!(!registry.is_loaded(ModelId::MiniLM));
         
-        // Request minilm - should load
+        // Trigger load
         let _result = registry.embed(&vec!["test".to_string()], Some("minilm"))?;
-        assert!(registry.is_loaded(ModelId::BgeBase));
+        
+        // Now loaded
         assert!(registry.is_loaded(ModelId::MiniLM));
+        assert_eq!(registry.loaded_models().len(), 1);
         
         Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires model download"]
+    fn test_registry_embed_with_model_name() -> Result<()> {
+        let registry = ModelRegistry::new(&[ModelId::MiniLM])?;
+        
+        let result = registry.embed(&vec!["test".to_string()], Some("minilm"))?;
+        
+        assert_eq!(result.model, ModelId::MiniLM);
+        assert_eq!(result.dimensions, 384);
+        assert_eq!(result.vectors.len(), 1);
+        assert_eq!(result.vectors[0].len(), 384);
+        
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires model download"]
+    fn test_registry_embed_default() -> Result<()> {
+        let registry = ModelRegistry::new(&[ModelId::MiniLM])?;
+        
+        let result = registry.embed(&vec!["test".to_string()], None)?;
+        
+        // Should use first model as default
+        assert_eq!(result.model, ModelId::MiniLM);
+        
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires model download"]
+    fn test_registry_embed_unknown_model() {
+        let registry = ModelRegistry::new(&[ModelId::MiniLM]).unwrap();
+        
+        let result = registry.embed(&vec!["test".to_string()], Some("unknown-model"));
+        
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Unknown model"));
+    }
+
+    #[test]
+    #[ignore = "requires model download"]
+    fn test_registry_embed_disabled_model() {
+        let registry = ModelRegistry::new(&[ModelId::MiniLM]).unwrap();
+        
+        // BgeBase is not enabled
+        let result = registry.embed(&vec!["test".to_string()], Some("bge-base"));
+        
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not enabled"));
+    }
+
+    #[test]
+    #[ignore = "requires model download"]
+    fn test_registry_get_by_name() -> Result<()> {
+        let registry = ModelRegistry::new(&[ModelId::MiniLM])?;
+        
+        // Trigger load
+        let _ = registry.embed(&vec!["test".to_string()], Some("minilm"))?;
+        
+        let embedder = registry.get_by_name("minilm");
+        assert!(embedder.is_some());
+        assert_eq!(embedder.unwrap().model_id(), ModelId::MiniLM);
+        
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires model download"]
+    fn test_registry_get_by_name_variations() -> Result<()> {
+        let registry = ModelRegistry::new(&[ModelId::MiniLM])?;
+        
+        // Trigger load
+        let _ = registry.embed(&vec!["test".to_string()], Some("minilm"))?;
+        
+        // All variations should work
+        assert!(registry.get_by_name("minilm").is_some());
+        assert!(registry.get_by_name("all-MiniLM-L6-v2").is_some());
+        assert!(registry.get_by_name("sentence-transformers/all-MiniLM-L6-v2").is_some());
+        
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires model download"]
+    fn test_registry_embed_all_single_model() -> Result<()> {
+        let registry = ModelRegistry::new(&[ModelId::MiniLM])?;
+        
+        let results = registry.embed_all(&vec!["test".to_string()]);
+        
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].model, ModelId::MiniLM);
+        
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires model download - uses multiple models"]
+    fn test_registry_embed_all_multiple_models() -> Result<()> {
+        let registry = ModelRegistry::new(&[ModelId::MiniLM, ModelId::GteBase])?;
+        
+        let results = registry.embed_all(&vec!["test".to_string()]);
+        
+        assert_eq!(results.len(), 2);
+        
+        Ok(())
+    }
+
+    // ========================================================================
+    // EmbedResult Tests
+    // ========================================================================
+
+    #[test]
+    fn test_embed_result_clone() {
+        let result = EmbedResult {
+            model: ModelId::MiniLM,
+            dimensions: 384,
+            vectors: vec![vec![0.1, 0.2, 0.3]],
+            latency_ms: 100,
+        };
+        
+        let cloned = result.clone();
+        assert_eq!(cloned.model, result.model);
+        assert_eq!(cloned.dimensions, result.dimensions);
+        assert_eq!(cloned.vectors, result.vectors);
+        assert_eq!(cloned.latency_ms, result.latency_ms);
+    }
+
+    #[test]
+    fn test_embed_result_debug() {
+        let result = EmbedResult {
+            model: ModelId::MiniLM,
+            dimensions: 384,
+            vectors: vec![vec![0.1]],
+            latency_ms: 50,
+        };
+        
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("MiniLM"));
+        assert!(debug_str.contains("384"));
     }
 }

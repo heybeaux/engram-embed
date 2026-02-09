@@ -9,8 +9,10 @@
 
 use anyhow::Result;
 use candle_core::{Device, IndexOp, Tensor, D};
-use candle_nn::{layer_norm, Embedding, LayerNorm, Module, VarBuilder};
+use candle_nn::{Embedding, Module, VarBuilder};
 use serde::Deserialize;
+
+use crate::metal_compat::{metal_safe_layer_norm, MetalSafeLayerNorm};
 
 /// NomicBert configuration
 #[derive(Debug, Clone, Deserialize)]
@@ -242,17 +244,17 @@ impl NomicAttention {
 
 /// NomicBert Encoder Layer
 struct NomicBertLayer {
-    norm1: LayerNorm,
+    norm1: MetalSafeLayerNorm,
     attn: NomicAttention,
-    norm2: LayerNorm,
+    norm2: MetalSafeLayerNorm,
     mlp: SwiGluMlp,
 }
 
 impl NomicBertLayer {
     fn new(vb: VarBuilder, cfg: &NomicBertConfig, rotary: RotaryEmbedding) -> Result<Self> {
-        let norm1 = layer_norm(cfg.hidden_size, cfg.layer_norm_epsilon, vb.pp("norm1"))?;
+        let norm1 = metal_safe_layer_norm(cfg.hidden_size, cfg.layer_norm_epsilon, vb.pp("norm1"))?;
         let attn = NomicAttention::new(vb.pp("attn"), cfg, rotary)?;
-        let norm2 = layer_norm(cfg.hidden_size, cfg.layer_norm_epsilon, vb.pp("norm2"))?;
+        let norm2 = metal_safe_layer_norm(cfg.hidden_size, cfg.layer_norm_epsilon, vb.pp("norm2"))?;
         let mlp = SwiGluMlp::new(vb.pp("mlp"), cfg)?;
         
         Ok(Self { norm1, attn, norm2, mlp })
@@ -275,7 +277,7 @@ impl NomicBertLayer {
 struct NomicBertEmbeddings {
     word_embeddings: Embedding,
     token_type_embeddings: Embedding,
-    layer_norm: LayerNorm,
+    layer_norm: MetalSafeLayerNorm,
 }
 
 impl NomicBertEmbeddings {
@@ -290,7 +292,7 @@ impl NomicBertEmbeddings {
             cfg.hidden_size,
             vb.pp("embeddings.token_type_embeddings"),
         )?;
-        let layer_norm = layer_norm(cfg.hidden_size, cfg.layer_norm_epsilon, vb.pp("emb_ln"))?;
+        let layer_norm = metal_safe_layer_norm(cfg.hidden_size, cfg.layer_norm_epsilon, vb.pp("emb_ln"))?;
         
         Ok(Self {
             word_embeddings,

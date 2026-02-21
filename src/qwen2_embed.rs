@@ -117,8 +117,11 @@ impl RotaryEmbedding {
         let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
         let cos = self.cos.narrow(0, 0, seq_len)?;
         let sin = self.sin.narrow(0, 0, seq_len)?;
-        let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
-        let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+        // Use rope_slow (pure tensor math) — works on all backends including Metal.
+        // candle-metal-kernels 0.9.x lacks the native rope Metal kernel, so the
+        // CustomOp3-based `rope()` fails on Metal.
+        let q_embed = candle_nn::rotary_emb::rope_slow(&q.contiguous()?, &cos, &sin)?;
+        let k_embed = candle_nn::rotary_emb::rope_slow(&k.contiguous()?, &cos, &sin)?;
         Ok((q_embed, k_embed))
     }
 }
@@ -244,7 +247,7 @@ impl BidirectionalAttention {
             None => attn_weights,
         };
 
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
         let attn_output = attn_weights.matmul(&v)?;
 
         attn_output

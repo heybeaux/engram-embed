@@ -24,6 +24,7 @@ use tracing::info;
 // Metal-compatible models
 use crate::metal_bert::{MetalBertConfig, MetalBertModel};
 use crate::nomic_bert::{NomicBertConfig, NomicBertModel};
+use crate::qwen2_embed::{Qwen2EmbedConfig, Qwen2EmbedModel};
 
 /// Supported model identifiers
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -32,6 +33,7 @@ pub enum ModelId {
     MiniLM,
     GteBase,
     Nomic,
+    KalmV2,
 }
 
 impl ModelId {
@@ -45,6 +47,8 @@ impl ModelId {
             "nomic" | "nomic-embed-text-v1.5" | "nomic-ai/nomic-embed-text-v1.5" => {
                 Some(Self::Nomic)
             }
+            "kalm-v2" | "kalm" | "kalm-embedding-v2"
+            | "hit-tmg/kalm-embedding-multilingual-mini-instruct-v2" => Some(Self::KalmV2),
             _ => None,
         }
     }
@@ -55,6 +59,7 @@ impl ModelId {
             Self::MiniLM => "sentence-transformers/all-MiniLM-L6-v2",
             Self::GteBase => "thenlper/gte-base",
             Self::Nomic => "nomic-ai/nomic-embed-text-v1.5",
+            Self::KalmV2 => "HIT-TMG/KaLM-embedding-multilingual-mini-instruct-v2",
         }
     }
 
@@ -64,6 +69,7 @@ impl ModelId {
             Self::MiniLM => 384,
             Self::GteBase => 768,
             Self::Nomic => 768,
+            Self::KalmV2 => 896,
         }
     }
 
@@ -73,6 +79,7 @@ impl ModelId {
             Self::MiniLM => 256,
             Self::GteBase => 512,
             Self::Nomic => 8192,
+            Self::KalmV2 => 512,
         }
     }
 
@@ -82,6 +89,7 @@ impl ModelId {
             Self::MiniLM => "minilm",
             Self::GteBase => "gte-base",
             Self::Nomic => "nomic",
+            Self::KalmV2 => "kalm-v2",
         }
     }
 
@@ -90,13 +98,39 @@ impl ModelId {
     pub fn prefix(&self) -> Option<&'static str> {
         match self {
             Self::Nomic => Some("search_document: "),
+            // KaLM-V2 default prefix is for documents (no prefix).
+            // Query prefix is handled via query_prefix().
+            Self::KalmV2 => None,
             _ => None,
         }
     }
 
-    /// All available models
+    /// Query-specific prefix (for retrieval models that distinguish query vs document)
+    pub fn query_prefix(&self) -> Option<&'static str> {
+        match self {
+            Self::Nomic => Some("search_query: "),
+            Self::KalmV2 => Some("Instruct: Given a query, retrieve relevant passages\nQuery: "),
+            _ => None,
+        }
+    }
+
+    /// Document-specific prefix
+    pub fn document_prefix(&self) -> Option<&'static str> {
+        match self {
+            Self::Nomic => Some("search_document: "),
+            Self::KalmV2 => None,
+            _ => None,
+        }
+    }
+
+    /// All available models (does NOT include opt-in models like KalmV2)
     pub fn all() -> &'static [ModelId] {
         &[ModelId::BgeBase, ModelId::MiniLM, ModelId::GteBase, ModelId::Nomic]
+    }
+
+    /// All models including opt-in models
+    pub fn all_including_optional() -> &'static [ModelId] {
+        &[ModelId::BgeBase, ModelId::MiniLM, ModelId::GteBase, ModelId::Nomic, ModelId::KalmV2]
     }
 }
 
@@ -112,6 +146,8 @@ enum ModelBackend {
     MetalBert(MetalBertModel),
     /// Nomic BERT with rotary embeddings
     NomicBert(NomicBertModel),
+    /// Qwen2-based embedding (KaLM-V2)
+    Qwen2Embed(Qwen2EmbedModel),
 }
 
 /// Single embedding model wrapper
@@ -159,16 +195,22 @@ impl Embedder {
             direction: TruncationDirection::Right,
         })).map_err(|e| anyhow::anyhow!("Failed to set truncation: {}", e))?;
 
+        // Select dtype — KaLM-V2 uses FP16 by default, others use F32
+        let load_dtype = match model_id {
+            ModelId::KalmV2 => DType::F16,
+            _ => DType::F32,
+        };
+
         // Load model weights
-        info!("Loading model weights for {}...", hf_id);
+        info!("Loading model weights for {} (dtype: {:?})...", hf_id, load_dtype);
         let vb = if weights_path
             .extension()
             .map_or(false, |e| e == "safetensors")
         {
-            unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, &device)? }
+            unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], load_dtype, &device)? }
         } else {
             // PyTorch .bin format
-            VarBuilder::from_pth(weights_path, DType::F32, &device)?
+            VarBuilder::from_pth(weights_path, load_dtype, &device)?
         };
 
         // Load model based on architecture
@@ -179,6 +221,12 @@ impl Embedder {
                 let config: NomicBertConfig = serde_json::from_str(&config_str)?;
                 let nomic_model = NomicBertModel::load(vb, &config)?;
                 ModelBackend::NomicBert(nomic_model)
+            }
+            ModelId::KalmV2 => {
+                // Qwen2-based bidirectional embedding model
+                let config: Qwen2EmbedConfig = serde_json::from_str(&config_str)?;
+                let qwen2_model = Qwen2EmbedModel::load(vb, &config)?;
+                ModelBackend::Qwen2Embed(qwen2_model)
             }
             _ => {
                 // Standard BERT-based models (BGE, MiniLM, GTE)
@@ -317,6 +365,9 @@ impl Embedder {
                 model.forward(&input_ids, &token_type_ids, Some(&attention_mask))?
             }
             ModelBackend::NomicBert(model) => {
+                model.forward(&input_ids, &token_type_ids, Some(&attention_mask))?
+            }
+            ModelBackend::Qwen2Embed(model) => {
                 model.forward(&input_ids, &token_type_ids, Some(&attention_mask))?
             }
         };
@@ -632,6 +683,18 @@ mod tests {
     }
 
     #[test]
+    fn test_model_id_parsing_kalm_v2() {
+        assert_eq!(ModelId::from_str("kalm-v2"), Some(ModelId::KalmV2));
+        assert_eq!(ModelId::from_str("kalm"), Some(ModelId::KalmV2));
+        assert_eq!(ModelId::from_str("KALM-V2"), Some(ModelId::KalmV2));
+        assert_eq!(ModelId::from_str("kalm-embedding-v2"), Some(ModelId::KalmV2));
+        assert_eq!(
+            ModelId::from_str("hit-tmg/kalm-embedding-multilingual-mini-instruct-v2"),
+            Some(ModelId::KalmV2)
+        );
+    }
+
+    #[test]
     fn test_model_id_parsing_unknown() {
         assert_eq!(ModelId::from_str("unknown"), None);
         assert_eq!(ModelId::from_str("gpt-4"), None);
@@ -649,6 +712,7 @@ mod tests {
         assert_eq!(ModelId::MiniLM.dimensions(), 384);
         assert_eq!(ModelId::GteBase.dimensions(), 768);
         assert_eq!(ModelId::Nomic.dimensions(), 768);
+        assert_eq!(ModelId::KalmV2.dimensions(), 896);
     }
 
     #[test]
@@ -657,6 +721,7 @@ mod tests {
         assert_eq!(ModelId::MiniLM.max_tokens(), 256);
         assert_eq!(ModelId::GteBase.max_tokens(), 512);
         assert_eq!(ModelId::Nomic.max_tokens(), 8192);
+        assert_eq!(ModelId::KalmV2.max_tokens(), 512);
     }
 
     #[test]
@@ -665,6 +730,24 @@ mod tests {
         assert_eq!(ModelId::MiniLM.prefix(), None);
         assert_eq!(ModelId::GteBase.prefix(), None);
         assert_eq!(ModelId::Nomic.prefix(), Some("search_document: "));
+        assert_eq!(ModelId::KalmV2.prefix(), None);
+    }
+
+    #[test]
+    fn test_model_query_prefix() {
+        assert_eq!(ModelId::BgeBase.query_prefix(), None);
+        assert_eq!(ModelId::Nomic.query_prefix(), Some("search_query: "));
+        assert_eq!(
+            ModelId::KalmV2.query_prefix(),
+            Some("Instruct: Given a query, retrieve relevant passages\nQuery: ")
+        );
+    }
+
+    #[test]
+    fn test_model_document_prefix() {
+        assert_eq!(ModelId::BgeBase.document_prefix(), None);
+        assert_eq!(ModelId::Nomic.document_prefix(), Some("search_document: "));
+        assert_eq!(ModelId::KalmV2.document_prefix(), None);
     }
 
     #[test]
@@ -673,6 +756,10 @@ mod tests {
         assert_eq!(ModelId::MiniLM.to_hf_id(), "sentence-transformers/all-MiniLM-L6-v2");
         assert_eq!(ModelId::GteBase.to_hf_id(), "thenlper/gte-base");
         assert_eq!(ModelId::Nomic.to_hf_id(), "nomic-ai/nomic-embed-text-v1.5");
+        assert_eq!(
+            ModelId::KalmV2.to_hf_id(),
+            "HIT-TMG/KaLM-embedding-multilingual-mini-instruct-v2"
+        );
     }
 
     #[test]
@@ -681,6 +768,7 @@ mod tests {
         assert_eq!(ModelId::MiniLM.display_name(), "minilm");
         assert_eq!(ModelId::GteBase.display_name(), "gte-base");
         assert_eq!(ModelId::Nomic.display_name(), "nomic");
+        assert_eq!(ModelId::KalmV2.display_name(), "kalm-v2");
     }
 
     #[test]
@@ -691,6 +779,15 @@ mod tests {
         assert!(all.contains(&ModelId::MiniLM));
         assert!(all.contains(&ModelId::GteBase));
         assert!(all.contains(&ModelId::Nomic));
+        // KalmV2 is opt-in, not in default all()
+        assert!(!all.contains(&ModelId::KalmV2));
+    }
+
+    #[test]
+    fn test_model_all_including_optional() {
+        let all = ModelId::all_including_optional();
+        assert_eq!(all.len(), 5);
+        assert!(all.contains(&ModelId::KalmV2));
     }
 
     #[test]

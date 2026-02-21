@@ -91,8 +91,11 @@ curl -X POST http://127.0.0.1:8080/v1/embeddings \
 | `minilm` | 384 | 256 | Fast, short text | ~90MB |
 | `gte-base` | 768 | 512 | Alternative semantic space | ~450MB |
 | `nomic` | 768 | 8192 | Long documents, code | ~550MB |
+| `kalm-v2` | 896 | 512 | High-quality multilingual (opt-in) | ~1GB |
 
 **Default:** `bge-base` — top-tier open-source embeddings, excellent quality/speed tradeoff.
+
+> **KaLM-V2** ([HIT-TMG/KaLM-embedding-multilingual-mini-instruct-v2](https://huggingface.co/HIT-TMG/KaLM-embedding-multilingual-mini-instruct-v2)) — a 0.5B Qwen2-based embedding model that rivals models 3-26× larger on MTEB benchmarks. Opt-in only: `EMBED_MODELS=kalm-v2` or `EMBED_MODELS=bge-base,kalm-v2`. Uses instruction prefixes for queries; no prefix for documents. Apache 2.0 licensed.
 
 ### Enable Multiple Models
 

@@ -24,6 +24,7 @@ mod metal_bert;
 mod metal_compat;
 mod metrics;
 mod nomic_bert;
+mod qwen2_embed;
 
 use embedder::{ModelId, ModelRegistry};
 use metrics::Metrics;

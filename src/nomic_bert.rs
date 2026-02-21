@@ -145,15 +145,15 @@ impl SwiGluMlp {
     }
     
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // SwiGLU: fc2(SiLU(fc11(x)) * fc12(x))
-        // Reshape to 2D for matmul, then back to 3D
+        // SwiGLU: fc2(fc11(x) * SiLU(fc12(x)))
+        // fc11 = value projection (no activation), fc12 = gate projection (with SiLU)
         let (batch_size, seq_len, hidden_size) = x.dims3()?;
         let x_2d = x.reshape((batch_size * seq_len, hidden_size))?;
         
-        let gate = x_2d.matmul(&self.fc11.t()?)?;
+        let value = x_2d.matmul(&self.fc11.t()?)?;
+        let gate = x_2d.matmul(&self.fc12.t()?)?;
         let gate = candle_nn::ops::silu(&gate)?;
-        let value = x_2d.matmul(&self.fc12.t()?)?;
-        let hidden = gate.mul(&value)?;
+        let hidden = value.mul(&gate)?;
         let out = hidden.matmul(&self.fc2.t()?)?;
         
         out.reshape((batch_size, seq_len, hidden_size)).map_err(Into::into)
@@ -261,15 +261,13 @@ impl NomicBertLayer {
     }
     
     fn forward(&self, x: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
-        // Pre-norm attention with residual
-        let normed = self.norm1.forward(x)?;
-        let attn_out = self.attn.forward(&normed, attention_mask)?;
-        let x = (x + attn_out)?;
+        // Post-norm: norm AFTER residual add (nomic config has prenorm=false)
+        let attn_out = self.attn.forward(x, attention_mask)?;
+        let x = self.norm1.forward(&(x + attn_out)?)?;
         
-        // Pre-norm MLP with residual
-        let normed = self.norm2.forward(&x)?;
-        let mlp_out = self.mlp.forward(&normed)?;
-        (x + mlp_out).map_err(Into::into)
+        let mlp_out = self.mlp.forward(&x)?;
+        let x = self.norm2.forward(&(x + mlp_out)?)?;
+        Ok(x)
     }
 }
 

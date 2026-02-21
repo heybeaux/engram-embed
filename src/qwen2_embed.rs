@@ -333,7 +333,8 @@ pub struct Qwen2EmbedModel {
 
 impl Qwen2EmbedModel {
     pub fn load(vb: VarBuilder, cfg: &Qwen2EmbedConfig) -> candle_core::Result<Self> {
-        let vb_m = vb.pp("model");
+        // KaLM-V2 safetensors use flat keys (no "model." prefix)
+        let vb_m = vb.clone();
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
         let rotary_emb = RotaryEmbedding::new(vb.dtype(), cfg, vb_m.device())?;
@@ -376,6 +377,7 @@ impl Qwen2EmbedModel {
                 let on_false = Tensor::new(f32::NEG_INFINITY, &self.device)?
                     .broadcast_as(mask.shape())?
                     .to_dtype(self.dtype)?;
+                let mask = mask.to_dtype(DType::U8)?;
                 Some(mask.where_cond(&on_true, &on_false)?)
             }
             None => None,

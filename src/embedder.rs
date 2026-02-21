@@ -197,7 +197,7 @@ impl Embedder {
 
         // Select dtype — KaLM-V2 uses FP16 by default, others use F32
         let load_dtype = match model_id {
-            ModelId::KalmV2 => DType::F16,
+            ModelId::KalmV2 => DType::F32,
             _ => DType::F32,
         };
 

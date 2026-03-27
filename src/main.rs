@@ -12,6 +12,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::signal;
@@ -125,6 +126,10 @@ struct ModelStatus {
 struct AppState {
     registry: ModelRegistry,
     metrics: Metrics,
+    /// True while startup model pre-loading is in progress.
+    /// Health endpoint returns {"status":"starting"} without acquiring any lock
+    /// until this flips to false, preventing crash loops from watchdog timeouts.
+    loading: Arc<AtomicBool>,
     #[allow(dead_code)]
     shutdown_rx: watch::Receiver<bool>,
 }
@@ -134,6 +139,23 @@ struct AppState {
 // ============================================================================
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
+    // Fast path: if startup pre-loading is still in progress, return immediately
+    // without acquiring any model registry lock. This prevents the watchdog from
+    // timing out and killing the process while models are being loaded on Metal GPU.
+    if state.loading.load(Ordering::Relaxed) {
+        return Json(HealthResponse {
+            status: "starting".to_string(),
+            models: vec![],
+            loaded_count: 0,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            uptime_secs: state.metrics.uptime_secs(),
+            memory_bytes: 0,
+            memory_mb: 0.0,
+            last_embedding_time: None,
+            in_flight_requests: 0,
+        });
+    }
+
     let enabled = state.registry.enabled_models();
     let loaded = state.registry.loaded_models();
     let default_model = enabled.first().copied().unwrap_or(ModelId::BgeBase);
@@ -191,8 +213,14 @@ async fn embed(
 
     // Check if requesting all models
     if request.model == "*" || request.model == "all" {
+        // Run CPU-bound inference on blocking thread pool so the async
+        // runtime (and health endpoint) stay responsive.
+        let state_clone = state.clone();
+        let texts_clone = texts.clone();
         let start = Instant::now();
-        let results = state.registry.embed_all(&texts);
+        let results = tokio::task::spawn_blocking(move || state_clone.registry.embed_all(&texts_clone))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let total_ms = start.elapsed().as_millis() as u64;
 
         // Record metrics for each model
@@ -241,11 +269,18 @@ async fn embed(
     }
 
     // Single model request (OpenAI-compatible)
+    // Run CPU-bound inference on blocking thread pool so the async
+    // runtime (and health endpoint) stay responsive.
+    let state_clone = state.clone();
+    let model_name = request.model.clone();
+    let texts_clone = texts.clone();
     let start = Instant::now();
-    let result = state
-        .registry
-        .embed(&texts, Some(&request.model))
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let result = tokio::task::spawn_blocking(move || {
+        state_clone.registry.embed(&texts_clone, Some(&model_name))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     
     let latency_us = start.elapsed().as_micros() as u64;
     let latency_ms = latency_us / 1000;
@@ -395,12 +430,34 @@ async fn main() -> Result<()> {
     // Create shutdown channel
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+    // loading=true while we pre-warm models; health returns "starting" during this window
+    // so the watchdog never kills a healthy process mid-load.
+    let loading = Arc::new(AtomicBool::new(true));
+
     // Create app state
     let state = Arc::new(AppState { 
-        registry, 
+        registry,
         metrics,
+        loading: loading.clone(),
         shutdown_rx,
     });
+
+    // Eagerly pre-load all enabled models using spawn_blocking so the heavy
+    // synchronous Candle/Metal work doesn't starve the async Tokio runtime.
+    // health returns {"status":"starting"} until loading flips false.
+    {
+        let state_clone = state.clone();
+        let loading_clone = loading.clone();
+        tokio::task::spawn_blocking(move || {
+            let model_list = state_clone.registry.enabled_models();
+            for model_id in model_list {
+                info!(model = model_id.display_name(), "Pre-loading model...");
+                let _ = state_clone.registry.embed(&["warmup".to_string()], Some(model_id.display_name()));
+            }
+            loading_clone.store(false, Ordering::Relaxed);
+            info!("All models pre-loaded, health endpoint now active");
+        });
+    }
 
     // Build router
     let app = Router::new()

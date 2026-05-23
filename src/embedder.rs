@@ -260,47 +260,15 @@ impl Embedder {
         self.model_id.dimensions()
     }
 
-    /// Select the best available device for a given model
-    /// 
-    /// All models now use Metal-compatible implementations (MetalSafeLayerNorm).
-    /// Control via EMBED_DEVICE env var: "cpu" to force CPU, "metal" to use Metal.
-    fn select_device(model_id: ModelId) -> Result<Device> {
-        // Check for forced CPU mode
-        let force_cpu = std::env::var("EMBED_DEVICE")
-            .map(|v| v.to_lowercase() == "cpu")
-            .unwrap_or(false);
-        
-        if force_cpu {
-            info!("EMBED_DEVICE=cpu, using CPU");
-            return Ok(Device::Cpu);
-        }
-        
-        // Check if Metal is requested
-        let use_metal = std::env::var("EMBED_DEVICE")
-            .map(|v| v.to_lowercase() == "metal")
-            .unwrap_or(false);
-        
-        if use_metal {
-            #[cfg(target_os = "macos")]
-            {
-                match Device::new_metal(0) {
-                    Ok(device) => {
-                        info!("🔩 Using Metal GPU acceleration for {}", model_id);
-                        return Ok(device);
-                    }
-                    Err(e) => {
-                        info!("Metal not available: {}, falling back to CPU", e);
-                    }
-                }
-            }
-            
-            #[cfg(not(target_os = "macos"))]
-            {
-                info!("Metal only available on macOS, using CPU");
-            }
-        }
-        
-        Ok(Device::Cpu)
+    /// Select the best available device for a given model.
+    ///
+    /// Delegates to `metal_compat::select_device_with_metal`, which picks Metal
+    /// on macOS by default and falls back to CPU if `EMBED_DEVICE=cpu` is set
+    /// or Metal initialization fails. All BERT-family backends use
+    /// `MetalSafeLayerNorm` so the standard models run on Metal.
+    fn select_device(_model_id: ModelId) -> Result<Device> {
+        crate::metal_compat::select_device_with_metal()
+            .map_err(|e| anyhow::anyhow!("device selection failed: {}", e))
     }
 
     /// Generate embeddings for a batch of texts

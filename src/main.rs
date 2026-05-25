@@ -50,7 +50,10 @@ enum StringOrVec {
 }
 
 fn default_model() -> String {
-    "bge-base".to_string()
+    // minilm is the only model that currently passes fixture comparison
+    // (>0.999 cosine vs sentence-transformers). bge-base/gte-base/nomic are
+    // quarantined — see ModelId::quarantined().
+    "minilm".to_string()
 }
 
 /// OpenAI-compatible response
@@ -116,6 +119,12 @@ struct ModelStatus {
     max_tokens: usize,
     loaded: bool,
     default: bool,
+    /// Whether this model is quarantined pending a correctness fix.
+    /// Quarantined models reject requests unless ALLOW_QUARANTINED_MODELS=true.
+    quarantined: bool,
+    /// Human-readable reason if quarantined.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quarantine_reason: Option<String>,
 }
 
 // ============================================================================
@@ -136,7 +145,7 @@ struct AppState {
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let enabled = state.registry.enabled_models();
     let loaded = state.registry.loaded_models();
-    let default_model = enabled.first().copied().unwrap_or(ModelId::BgeBase);
+    let default_model = enabled.first().copied().unwrap_or(ModelId::MiniLM);
     
     let memory_bytes = state.metrics.memory_bytes();
     let last_time = state.metrics.last_embedding_time();
@@ -151,6 +160,8 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
                 max_tokens: m.max_tokens(),
                 loaded: loaded.contains(&m),
                 default: m == default_model,
+                quarantined: m.quarantined(),
+                quarantine_reason: m.quarantine_reason().map(String::from),
             })
             .collect(),
         loaded_count: loaded.len(),
@@ -302,6 +313,8 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
                 "dimensions": m.dimensions(),
                 "max_tokens": m.max_tokens(),
                 "loaded": loaded.contains(&m),
+                "quarantined": m.quarantined(),
+                "quarantine_reason": m.quarantine_reason(),
             })
         })
         .collect();
@@ -369,8 +382,8 @@ async fn main() -> Result<()> {
 
     // Determine which models to enable from env
     // Use "*" or "all" for all models, or comma-separated list
-    let models_env = std::env::var("EMBED_MODELS").unwrap_or_else(|_| "bge-base".to_string());
-    
+    let models_env = std::env::var("EMBED_MODELS").unwrap_or_else(|_| "minilm".to_string());
+
     let model_ids: Vec<ModelId> = if models_env == "*" || models_env.to_lowercase() == "all" {
         ModelId::all().to_vec()
     } else {
@@ -381,10 +394,30 @@ async fn main() -> Result<()> {
     };
 
     let model_ids = if model_ids.is_empty() {
-        vec![ModelId::BgeBase]
+        vec![ModelId::MiniLM]
     } else {
         model_ids
     };
+
+    // Surface quarantine status loudly at startup so operators see it in logs.
+    let quarantine_override = embedder::quarantine_override_enabled();
+    for m in &model_ids {
+        if m.quarantined() {
+            if quarantine_override {
+                warn!(
+                    model = m.display_name(),
+                    reason = m.quarantine_reason().unwrap_or(""),
+                    "QUARANTINED model enabled via ALLOW_QUARANTINED_MODELS — embeddings KNOWN-INCORRECT"
+                );
+            } else {
+                warn!(
+                    model = m.display_name(),
+                    reason = m.quarantine_reason().unwrap_or(""),
+                    "model is quarantined and will refuse requests; set ALLOW_QUARANTINED_MODELS=true to override"
+                );
+            }
+        }
+    }
 
     // Create registry (lazy loading - models loaded on first request)
     let registry = ModelRegistry::new(&model_ids)?;

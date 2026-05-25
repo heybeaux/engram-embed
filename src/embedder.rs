@@ -132,6 +132,49 @@ impl ModelId {
     pub fn all_including_optional() -> &'static [ModelId] {
         &[ModelId::BgeBase, ModelId::MiniLM, ModelId::GteBase, ModelId::Nomic, ModelId::KalmV2]
     }
+
+    /// Whether this model is quarantined pending a correctness fix.
+    ///
+    /// Phase 1 fixture comparison vs sentence-transformers (2026-05-25):
+    ///   - minilm  : 0.999999 cosine  ✅ trusted
+    ///   - bge-base: 0.978 avg        ❌ CLS vs mean pooling mismatch suspected
+    ///   - gte-base: 0.984 avg        ❌ outlier text idx 8 at 0.69
+    ///   - nomic   : 0.17 avg         ❌ near-random; SwiGLU/weight-key mapping suspected
+    ///
+    /// Quarantined models can be force-enabled via `ALLOW_QUARANTINED_MODELS=true`
+    /// for debugging, but they MUST NOT be used in production until the deltas close.
+    /// See tests/fixture_comparison.rs for the comparison harness.
+    pub fn quarantined(&self) -> bool {
+        matches!(self, Self::BgeBase | Self::GteBase | Self::Nomic)
+    }
+
+    /// One-line explanation of why a model is quarantined (for error messages).
+    pub fn quarantine_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::BgeBase => Some(
+                "bge-base: 0.978 avg cosine vs sentence-transformers (suspect CLS vs mean pooling mismatch); see tests/fixture_comparison.rs"
+            ),
+            Self::GteBase => Some(
+                "gte-base: 0.984 avg cosine vs sentence-transformers (text idx 8 outlier at 0.69); see tests/fixture_comparison.rs"
+            ),
+            Self::Nomic => Some(
+                "nomic: 0.17 avg cosine vs sentence-transformers (near-random; SwiGLU gate/value or weight-key mapping suspected); see tests/fixture_comparison.rs"
+            ),
+            _ => None,
+        }
+    }
+}
+
+/// Returns true if the operator has opted into quarantined models via env.
+/// Accepts `1`, `true`, `yes` (case-insensitive). Anything else (or unset) = false.
+pub fn quarantine_override_enabled() -> bool {
+    matches!(
+        std::env::var("ALLOW_QUARANTINED_MODELS")
+            .unwrap_or_default()
+            .to_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
 }
 
 impl std::fmt::Display for ModelId {
@@ -489,6 +532,26 @@ impl ModelRegistry {
                 model_id.display_name(),
                 self.enabled_models.iter().map(|m| m.display_name()).collect::<Vec<_>>()
             ));
+        }
+
+        // Quarantine gate: refuse known-broken models unless the operator has
+        // explicitly opted in via ALLOW_QUARANTINED_MODELS=true.
+        if model_id.quarantined() {
+            if quarantine_override_enabled() {
+                tracing::warn!(
+                    model = model_id.display_name(),
+                    reason = model_id.quarantine_reason().unwrap_or(""),
+                    "Loading QUARANTINED model — embeddings are KNOWN-INCORRECT. \
+                     ALLOW_QUARANTINED_MODELS override is active. Do not use in production."
+                );
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Model '{}' is quarantined pending correctness fix. {}. \
+                     To force-enable for debugging, set ALLOW_QUARANTINED_MODELS=true.",
+                    model_id.display_name(),
+                    model_id.quarantine_reason().unwrap_or("see tests/fixture_comparison.rs")
+                ));
+            }
         }
 
         // Load the model (may need to evict first)
@@ -1199,6 +1262,89 @@ mod tests {
     // ========================================================================
     // EmbedResult Tests
     // ========================================================================
+
+    // ========================================================================
+    // Quarantine Tests
+    // ========================================================================
+
+    #[test]
+    fn test_quarantined_flag_per_model() {
+        assert!(!ModelId::MiniLM.quarantined(), "minilm passes fixture comparison");
+        assert!(!ModelId::KalmV2.quarantined(), "kalm-v2 is opt-in but not quarantined");
+        assert!(ModelId::BgeBase.quarantined(), "bge-base is quarantined pending pooling fix");
+        assert!(ModelId::GteBase.quarantined(), "gte-base is quarantined pending outlier fix");
+        assert!(ModelId::Nomic.quarantined(), "nomic is quarantined pending SwiGLU fix");
+    }
+
+    #[test]
+    fn test_quarantine_reason_present_for_broken_models() {
+        assert!(ModelId::BgeBase.quarantine_reason().is_some());
+        assert!(ModelId::GteBase.quarantine_reason().is_some());
+        assert!(ModelId::Nomic.quarantine_reason().is_some());
+        assert!(ModelId::MiniLM.quarantine_reason().is_none());
+        assert!(ModelId::KalmV2.quarantine_reason().is_none());
+
+        // All reasons reference the fixture comparison harness so error messages stay
+        // actionable.
+        for m in [ModelId::BgeBase, ModelId::GteBase, ModelId::Nomic] {
+            let reason = m.quarantine_reason().unwrap();
+            assert!(
+                reason.contains("fixture_comparison"),
+                "reason for {} should reference fixture_comparison, got: {}",
+                m.display_name(),
+                reason
+            );
+        }
+    }
+
+    #[test]
+    fn test_registry_rejects_quarantined_model_by_default() {
+        // SAFETY: env mutation is process-global. We snapshot+restore to avoid
+        // poisoning other tests in the same binary.
+        let prior = std::env::var("ALLOW_QUARANTINED_MODELS").ok();
+        std::env::remove_var("ALLOW_QUARANTINED_MODELS");
+
+        let registry = ModelRegistry::new(&[ModelId::BgeBase]).unwrap();
+        let result = registry.embed(&vec!["test".to_string()], Some("bge-base"));
+
+        // restore env before any assertion that could panic
+        match prior {
+            Some(v) => std::env::set_var("ALLOW_QUARANTINED_MODELS", v),
+            None => std::env::remove_var("ALLOW_QUARANTINED_MODELS"),
+        }
+
+        let err = result.expect_err("quarantined model must reject without opt-in");
+        let msg = err.to_string();
+        assert!(msg.contains("quarantined"), "error should mention quarantine: {}", msg);
+        assert!(
+            msg.contains("ALLOW_QUARANTINED_MODELS"),
+            "error should mention the opt-in env: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_quarantine_override_helper_parses_truthy_values() {
+        let prior = std::env::var("ALLOW_QUARANTINED_MODELS").ok();
+
+        std::env::remove_var("ALLOW_QUARANTINED_MODELS");
+        assert!(!quarantine_override_enabled());
+
+        for v in ["true", "TRUE", "True", "1", "yes", "YES"] {
+            std::env::set_var("ALLOW_QUARANTINED_MODELS", v);
+            assert!(quarantine_override_enabled(), "{} should be truthy", v);
+        }
+
+        for v in ["", "0", "false", "no", "anything-else"] {
+            std::env::set_var("ALLOW_QUARANTINED_MODELS", v);
+            assert!(!quarantine_override_enabled(), "{} should be falsy", v);
+        }
+
+        match prior {
+            Some(v) => std::env::set_var("ALLOW_QUARANTINED_MODELS", v),
+            None => std::env::remove_var("ALLOW_QUARANTINED_MODELS"),
+        }
+    }
 
     #[test]
     fn test_embed_result_clone() {

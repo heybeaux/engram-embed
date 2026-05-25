@@ -85,15 +85,38 @@ curl -X POST http://127.0.0.1:8080/v1/embeddings \
 
 ## Models
 
-| Model | Dimensions | Max Tokens | Best For | Memory |
-|-------|------------|------------|----------|--------|
-| `bge-base` | 768 | 512 | General purpose, best quality | ~450MB |
-| `minilm` | 384 | 256 | Fast, short text | ~90MB |
-| `gte-base` | 768 | 512 | Alternative semantic space | ~450MB |
-| `nomic` | 768 | 8192 | Long documents, code | ~550MB |
-| `kalm-v2` | 896 | 512 | High-quality multilingual (opt-in) | ~1GB |
+| Model | Dimensions | Max Tokens | Best For | Memory | Status |
+|-------|------------|------------|----------|--------|--------|
+| `bge-base` | 768 | 512 | General purpose, best quality | ~450MB | **quarantined** |
+| `minilm` | 384 | 256 | Fast, short text | ~90MB | ✅ trusted |
+| `gte-base` | 768 | 512 | Alternative semantic space | ~450MB | **quarantined** |
+| `nomic` | 768 | 8192 | Long documents, code | ~550MB | **quarantined** |
+| `kalm-v2` | 896 | 512 | High-quality multilingual (opt-in) | ~1GB | unverified (opt-in) |
 
-**Default:** `bge-base` — top-tier open-source embeddings, excellent quality/speed tradeoff.
+**Default:** `minilm` — currently the only model with verified correctness (≥0.999 cosine vs sentence-transformers).
+
+### ⚠️ Quarantined models (2026-05-25)
+
+Phase 1 fixture comparison vs the reference `sentence-transformers` outputs found three local models producing incorrect embeddings:
+
+| Model | Avg cosine vs reference | Suspected cause |
+|-------|-------------------------|-----------------|
+| `minilm` | 0.999999 | ✅ correct |
+| `bge-base` | 0.978 | CLS vs mean pooling mismatch |
+| `gte-base` | 0.984 | text idx 8 outlier at 0.69 |
+| `nomic` | 0.17 | SwiGLU gate/value ordering or weight-key mapping |
+
+Until these are fixed, `bge-base`, `gte-base`, and `nomic` are **quarantined**: requests that target them return HTTP 400 with a quarantine message. The model code stays in the tree; only the runtime guard is new.
+
+To force-enable a quarantined model for debugging (NOT production):
+
+```bash
+ALLOW_QUARANTINED_MODELS=true EMBED_MODELS=bge-base cargo run --release
+```
+
+This emits a `WARN` log every time a quarantined model is loaded. `GET /health` and `GET /v1/models` both report `quarantined: true` and `quarantine_reason` per model.
+
+See `tests/fixture_comparison.rs` for the harness that produced these deltas.
 
 > **KaLM-V2** ([HIT-TMG/KaLM-embedding-multilingual-mini-instruct-v2](https://huggingface.co/HIT-TMG/KaLM-embedding-multilingual-mini-instruct-v2)) — a 0.5B Qwen2-based embedding model that rivals models 3-26× larger on MTEB benchmarks. Opt-in only: `EMBED_MODELS=kalm-v2` or `EMBED_MODELS=bge-base,kalm-v2`. Uses instruction prefixes for queries; no prefix for documents. Apache 2.0 licensed.
 
@@ -101,12 +124,13 @@ curl -X POST http://127.0.0.1:8080/v1/embeddings \
 
 ```bash
 # Single model (default)
-EMBED_MODELS=bge-base cargo run --release
+EMBED_MODELS=minilm cargo run --release
 
-# Multiple models for ensemble
-EMBED_MODELS=bge-base,minilm,nomic cargo run --release
+# Multiple models for ensemble — bge-base/nomic are quarantined; see "Quarantined models" above
+EMBED_MODELS=minilm cargo run --release
+# ALLOW_QUARANTINED_MODELS=true EMBED_MODELS=bge-base,minilm,nomic cargo run --release   # debugging only
 
-# All available models
+# All available models (will WARN/refuse on quarantined ones unless overridden)
 EMBED_MODELS=all cargo run --release
 ```
 

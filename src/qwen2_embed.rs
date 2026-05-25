@@ -238,8 +238,10 @@ impl BidirectionalAttention {
         let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
 
         // Scaled dot-product attention — NO causal mask (bidirectional)
+        // contiguous() required: k.transpose produces a non-contiguous view and
+        // Metal matmul requires contiguous input strides.
         let scale = 1f64 / f64::sqrt(self.head_dim as f64);
-        let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        let attn_weights = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
 
         // Only apply padding mask if provided (not causal mask)
         let attn_weights = match attention_mask {
@@ -250,8 +252,11 @@ impl BidirectionalAttention {
         let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
         let attn_output = attn_weights.matmul(&v)?;
 
+        // contiguous() required before reshape: transpose creates a non-contiguous
+        // view that reshape cannot reinterpret without a copy.
         attn_output
             .transpose(1, 2)?
+            .contiguous()?
             .reshape((b_sz, seq_len, self.hidden_size))?
             .apply(&self.o_proj)
     }

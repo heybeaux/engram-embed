@@ -231,10 +231,12 @@ impl NomicAttention {
         // Make v contiguous to avoid striding issues
         let attn_output = attn_weights.matmul(&v.contiguous()?)?;
         
-        // Reshape back
-        let attn_output = attn_output.permute((0, 2, 1, 3))?;  // (batch, seq, heads, head_dim)
+        // Reshape back — contiguous() required before reshape because permute
+        // produces a non-contiguous view; reshape on non-contiguous strides is
+        // either an error or a silent copy with wrong memory layout.
+        let attn_output = attn_output.permute((0, 2, 1, 3))?.contiguous()?;  // (batch, seq, heads, head_dim)
         let attn_output = attn_output.reshape((batch_size, seq_len, self.num_heads * self.head_dim))?;
-        
+
         // Output projection: reshape to 2D, matmul, reshape back
         let attn_2d = attn_output.reshape((batch_size * seq_len, self.num_heads * self.head_dim))?;
         let out = attn_2d.matmul(&self.out_proj.t()?)?;

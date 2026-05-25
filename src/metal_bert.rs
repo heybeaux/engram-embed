@@ -210,8 +210,9 @@ impl MetalBertSelfAttention {
         let attn_weights = candle_nn::ops::softmax(&scores, D::Minus1)?;
         let attn_output = attn_weights.matmul(&v.contiguous()?)?;
 
-        // Reshape back to (batch, seq, hidden)
-        let attn_output = attn_output.permute((0, 2, 1, 3))?;
+        // Reshape back to (batch, seq, hidden) — contiguous() required before
+        // reshape because permute produces a non-contiguous view.
+        let attn_output = attn_output.permute((0, 2, 1, 3))?.contiguous()?;
         attn_output
             .reshape((batch_size, seq_len, hidden_size))
             .map_err(Into::into)

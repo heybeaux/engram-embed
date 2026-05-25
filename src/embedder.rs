@@ -26,6 +26,17 @@ use crate::metal_bert::{MetalBertConfig, MetalBertModel};
 use crate::nomic_bert::{NomicBertConfig, NomicBertModel};
 use crate::qwen2_embed::{Qwen2EmbedConfig, Qwen2EmbedModel};
 
+/// How to pool per-token embeddings into a single sentence vector.
+///
+/// Mirrors the `1_Pooling/config.json` modes used by sentence-transformers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolingStrategy {
+    /// Take the [CLS] token embedding (index 0) as the sentence representation.
+    Cls,
+    /// Mean over the sequence dimension, weighted by the attention mask.
+    Mean,
+}
+
 /// Supported model identifiers
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModelId {
@@ -120,6 +131,23 @@ impl ModelId {
             Self::Nomic => Some("search_document: "),
             Self::KalmV2 => None,
             _ => None,
+        }
+    }
+
+    /// Sentence-transformers `1_Pooling/config.json` strategy for this model.
+    ///
+    /// Verified against the published HF repos on 2026-05-25:
+    ///   - BAAI/bge-base-en-v1.5         : pooling_mode_cls_token=true  → CLS
+    ///   - sentence-transformers/MiniLM  : pooling_mode_mean_tokens=true → MEAN
+    ///   - thenlper/gte-base             : pooling_mode_mean_tokens=true → MEAN
+    /// Nomic and KaLM-V2 use their own pooling paths inside their backends.
+    pub fn pooling(&self) -> PoolingStrategy {
+        match self {
+            Self::BgeBase => PoolingStrategy::Cls,
+            Self::MiniLM => PoolingStrategy::Mean,
+            Self::GteBase => PoolingStrategy::Mean,
+            Self::Nomic => PoolingStrategy::Mean,
+            Self::KalmV2 => PoolingStrategy::Mean,
         }
     }
 
@@ -383,8 +411,12 @@ impl Embedder {
             }
         };
 
-        // Mean pooling over sequence length (with attention mask)
-        let pooled = self.mean_pooling(&embeddings, &attention_mask)?;
+        // Pool per-token outputs into a single sentence vector using the
+        // model-specific strategy (BGE = CLS, MiniLM/GTE/Nomic = mean).
+        let pooled = match self.model_id.pooling() {
+            PoolingStrategy::Cls => self.cls_pooling(&embeddings)?,
+            PoolingStrategy::Mean => self.mean_pooling(&embeddings, &attention_mask)?,
+        };
 
         // Normalize if requested — ensure pooled is contiguous before norm math
         let final_embeddings = if self.normalize {
@@ -417,6 +449,15 @@ impl Embedder {
         let pooled = summed.broadcast_div(&mask_sum)?;
 
         Ok(pooled)
+    }
+
+    /// CLS pooling: take the first token (index 0) along the sequence dimension.
+    /// Matches sentence-transformers `pooling_mode_cls_token=true` (used by BGE).
+    fn cls_pooling(&self, embeddings: &Tensor) -> Result<Tensor> {
+        // embeddings: (batch, seq_len, hidden)
+        // Narrow to seq_len=1 starting at index 0, then squeeze.
+        let cls = embeddings.narrow(1, 0, 1)?.squeeze(1)?;
+        Ok(cls)
     }
 
     /// L2 normalize embeddings (unit vectors)

@@ -12,7 +12,7 @@
 //! - Running inference to get embeddings
 //! - Lazy loading with LRU eviction
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use hf_hub::{api::sync::Api, Repo, RepoType};
@@ -352,6 +352,7 @@ impl Embedder {
 
         // Convert to Vec<Vec<f32>>
         let result = final_embeddings.to_vec2::<f32>()?;
+        validate_embedding_batch(&result, self.model_id)?;
         Ok(result)
     }
 
@@ -384,6 +385,36 @@ impl Embedder {
         let normalized = embeddings.broadcast_div(&norm)?;
         Ok(normalized)
     }
+}
+
+fn validate_embedding_batch(embeddings: &[Vec<f32>], model_id: ModelId) -> Result<()> {
+    for (row_idx, embedding) in embeddings.iter().enumerate() {
+        if embedding.len() != model_id.dimensions() {
+            return Err(anyhow!(
+                "invalid embedding at row {} for model {}: expected {} dimensions, got {}",
+                row_idx,
+                model_id.display_name(),
+                model_id.dimensions(),
+                embedding.len()
+            ));
+        }
+
+        if let Some((col_idx, value)) = embedding
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(anyhow!(
+                "invalid embedding at row {}, col {} for model {}: non-finite value {}",
+                row_idx,
+                col_idx,
+                model_id.display_name(),
+                value
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Registry managing multiple embedding models with lazy loading
@@ -808,6 +839,33 @@ mod tests {
     // ========================================================================
     // Embedder Tests (require model download)
     // ========================================================================
+
+    #[test]
+    fn test_validate_embedding_batch_accepts_finite_vectors() -> Result<()> {
+        let embeddings = vec![vec![0.1; 768], vec![0.2; 768]];
+        validate_embedding_batch(&embeddings, ModelId::BgeBase)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_validate_embedding_batch_rejects_non_finite_values() {
+        let mut embeddings = vec![vec![0.1; 768]];
+        embeddings[0][42] = f32::NAN;
+
+        let err = validate_embedding_batch(&embeddings, ModelId::BgeBase).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("non-finite value"));
+        assert!(msg.contains("row 0, col 42"));
+    }
+
+    #[test]
+    fn test_validate_embedding_batch_rejects_dimension_mismatch() {
+        let embeddings = vec![vec![0.1; 767]];
+
+        let err = validate_embedding_batch(&embeddings, ModelId::BgeBase).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("expected 768 dimensions, got 767"));
+    }
 
     #[test]
     #[ignore = "requires model download"]

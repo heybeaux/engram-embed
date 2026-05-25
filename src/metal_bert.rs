@@ -284,6 +284,7 @@ struct MetalBertIntermediate {
     dense: Tensor,
     dense_bias: Tensor,
     act: HiddenAct,
+    intermediate_size: usize,
 }
 
 impl MetalBertIntermediate {
@@ -295,6 +296,7 @@ impl MetalBertIntermediate {
             dense,
             dense_bias,
             act: cfg.hidden_act,
+            intermediate_size: cfg.intermediate_size,
         })
     }
 
@@ -311,8 +313,10 @@ impl MetalBertIntermediate {
             HiddenAct::Relu => hidden.relu()?,
         };
 
+        // intermediate_size is the explicit post-projection dimension; using ()
+        // here caused corrupt tensor strides and garbage embeddings under load.
         hidden
-            .reshape((batch_size, seq_len, ()))
+            .reshape((batch_size, seq_len, self.intermediate_size))
             .map_err(Into::into)
     }
 }
@@ -478,5 +482,34 @@ mod tests {
     fn test_hidden_act_default() {
         let act: HiddenAct = Default::default();
         assert!(matches!(act, HiddenAct::Gelu));
+    }
+
+    /// Regression test: MetalBertIntermediate must reshape to (batch, seq, intermediate_size),
+    /// not (batch, seq, ()) which produced corrupt strides and garbage embeddings under load.
+    #[test]
+    fn test_intermediate_reshape_uses_intermediate_size() {
+        let cfg = test_config();
+        // Verify the config values we rely on
+        assert_eq!(cfg.intermediate_size, 3072);
+        assert_eq!(cfg.hidden_size, 768);
+        // intermediate_size must differ from hidden_size so a wrong reshape is detectable
+        assert_ne!(cfg.intermediate_size, cfg.hidden_size);
+
+        // Build a VarBuilder with random weights on CPU and run a forward pass
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(candle_core::DType::F32, &device);
+        let intermediate = MetalBertIntermediate::new(vb.pp("intermediate"), &cfg).unwrap();
+
+        // Input: (batch=1, seq=4, hidden=768)
+        let input = Tensor::zeros((1usize, 4usize, 768usize), candle_core::DType::F32, &device).unwrap();
+        let output = intermediate.forward(&input).unwrap();
+
+        // Output must be (1, 4, 3072) — not (1, 4, 768) or a bogus shape
+        assert_eq!(
+            output.dims(),
+            &[1, 4, 3072],
+            "intermediate output shape must be (batch, seq, intermediate_size=3072), got {:?}",
+            output.dims()
+        );
     }
 }

@@ -263,13 +263,18 @@ impl NomicBertLayer {
     }
     
     fn forward(&self, x: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
-        // Post-norm: norm AFTER residual add (nomic config has prenorm=false)
-        let attn_out = self.attn.forward(x, attention_mask)?;
-        let x = self.norm1.forward(&(x + attn_out)?)?;
-        
-        let mlp_out = self.mlp.forward(&x)?;
-        let x = self.norm2.forward(&(x + mlp_out)?)?;
-        Ok(x)
+        // Pre-norm: norm BEFORE sublayer, add residual after (HF config: prenorm=true).
+        // The previous post-norm ordering (norm after residual) produced plausible but
+        // incorrect embeddings — all existing Nomic embeddings need re-embedding.
+        let residual = x;
+        let normed = self.norm1.forward(x)?;
+        let attn_out = self.attn.forward(&normed, attention_mask)?;
+        let x = (residual + attn_out)?;
+
+        let residual = &x;
+        let normed = self.norm2.forward(&x)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        Ok((residual + mlp_out)?)
     }
 }
 

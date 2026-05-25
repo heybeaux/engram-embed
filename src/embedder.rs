@@ -343,15 +343,16 @@ impl Embedder {
         // Mean pooling over sequence length (with attention mask)
         let pooled = self.mean_pooling(&embeddings, &attention_mask)?;
 
-        // Normalize if requested
+        // Normalize if requested — ensure pooled is contiguous before norm math
         let final_embeddings = if self.normalize {
-            self.normalize_l2(&pooled)?
+            self.normalize_l2(&pooled.contiguous()?)?
         } else {
             pooled
         };
 
-        // Convert to Vec<Vec<f32>>
-        let result = final_embeddings.to_vec2::<f32>()?;
+        // Convert to Vec<Vec<f32>> — contiguous() ensures Metal/GPU tensor memory
+        // is fully resolved and laid out sequentially before host extraction.
+        let result = final_embeddings.contiguous()?.to_vec2::<f32>()?;
         validate_embedding_batch(&result, self.model_id)?;
         Ok(result)
     }

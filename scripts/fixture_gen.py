@@ -75,11 +75,14 @@ def compute_fixtures(output_dir: Path):
             texts_with_prefix = [f"{prefix}{t}" for t in TEXTS]
 
         print(f"  Computing embeddings for {len(TEXTS)} texts...")
+        # batch_size=1: some BERT models (e.g. GTE) have non-deterministic embeddings
+        # when texts of different lengths are batched together due to padding interactions
+        # with absolute position embeddings. Single-text batches are the stable reference.
         embeddings = model.encode(
             texts_with_prefix,
             normalize_embeddings=True,
             show_progress_bar=False,
-            batch_size=8,
+            batch_size=1,
         )
 
         fixture = {

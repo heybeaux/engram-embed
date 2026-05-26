@@ -15,28 +15,78 @@ use serde::Deserialize;
 use crate::metal_compat::{metal_safe_layer_norm, MetalSafeLayerNorm};
 
 /// NomicBert configuration
-#[derive(Debug, Clone, Deserialize)]
+///
+/// The HF nomic-embed-text-v1.5 config.json contains both canonical names
+/// (hidden_size, num_hidden_layers, …) and GPT-style aliases (n_embd, n_layer, …).
+/// Serde's `alias` attribute errors when BOTH are present in the JSON because it
+/// treats them as duplicate fields. We handle this via a raw helper struct that
+/// accepts all field names as Options, then resolves them.
+#[derive(Debug, Clone)]
 pub struct NomicBertConfig {
-    #[serde(default = "default_vocab_size")]
     pub vocab_size: usize,
-    #[serde(alias = "n_embd")]
     pub hidden_size: usize,
-    #[serde(alias = "n_layer")]
     pub num_hidden_layers: usize,
-    #[serde(alias = "n_head")]
     pub num_attention_heads: usize,
-    #[serde(alias = "n_inner")]
     pub intermediate_size: usize,
-    #[serde(alias = "n_positions")]
     pub max_position_embeddings: usize,
-    #[serde(default = "default_type_vocab_size")]
     pub type_vocab_size: usize,
-    #[serde(default = "default_layer_norm_eps")]
     pub layer_norm_epsilon: f64,
-    #[serde(default = "default_rotary_emb_base")]
     pub rotary_emb_base: f32,
-    #[serde(default = "default_rotary_emb_fraction")]
     pub rotary_emb_fraction: f32,
+}
+
+/// Raw deserialization helper — accepts both canonical and alias field names.
+#[derive(Deserialize)]
+struct NomicBertConfigRaw {
+    #[serde(default = "default_vocab_size")]
+    vocab_size: usize,
+    // Accept both naming conventions; canonical name wins when both present.
+    hidden_size: Option<usize>,
+    n_embd: Option<usize>,
+    num_hidden_layers: Option<usize>,
+    n_layer: Option<usize>,
+    num_attention_heads: Option<usize>,
+    n_head: Option<usize>,
+    intermediate_size: Option<usize>,
+    n_inner: Option<usize>,
+    max_position_embeddings: Option<usize>,
+    n_positions: Option<usize>,
+    #[serde(default = "default_type_vocab_size")]
+    type_vocab_size: usize,
+    #[serde(default = "default_layer_norm_eps")]
+    layer_norm_epsilon: f64,
+    #[serde(default = "default_rotary_emb_base")]
+    rotary_emb_base: f32,
+    #[serde(default = "default_rotary_emb_fraction")]
+    rotary_emb_fraction: f32,
+}
+
+impl<'de> Deserialize<'de> for NomicBertConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = NomicBertConfigRaw::deserialize(deserializer)?;
+        let hidden_size = raw.hidden_size.or(raw.n_embd)
+            .ok_or_else(|| serde::de::Error::missing_field("hidden_size"))?;
+        let num_hidden_layers = raw.num_hidden_layers.or(raw.n_layer)
+            .ok_or_else(|| serde::de::Error::missing_field("num_hidden_layers"))?;
+        let num_attention_heads = raw.num_attention_heads.or(raw.n_head)
+            .ok_or_else(|| serde::de::Error::missing_field("num_attention_heads"))?;
+        let intermediate_size = raw.intermediate_size.or(raw.n_inner)
+            .ok_or_else(|| serde::de::Error::missing_field("intermediate_size"))?;
+        let max_position_embeddings = raw.max_position_embeddings.or(raw.n_positions)
+            .ok_or_else(|| serde::de::Error::missing_field("max_position_embeddings"))?;
+        Ok(NomicBertConfig {
+            vocab_size: raw.vocab_size,
+            hidden_size,
+            num_hidden_layers,
+            num_attention_heads,
+            intermediate_size,
+            max_position_embeddings,
+            type_vocab_size: raw.type_vocab_size,
+            layer_norm_epsilon: raw.layer_norm_epsilon,
+            rotary_emb_base: raw.rotary_emb_base,
+            rotary_emb_fraction: raw.rotary_emb_fraction,
+        })
+    }
 }
 
 fn default_vocab_size() -> usize { 30528 }
@@ -231,10 +281,12 @@ impl NomicAttention {
         // Make v contiguous to avoid striding issues
         let attn_output = attn_weights.matmul(&v.contiguous()?)?;
         
-        // Reshape back
-        let attn_output = attn_output.permute((0, 2, 1, 3))?;  // (batch, seq, heads, head_dim)
+        // Reshape back — contiguous() required before reshape because permute
+        // produces a non-contiguous view; reshape on non-contiguous strides is
+        // either an error or a silent copy with wrong memory layout.
+        let attn_output = attn_output.permute((0, 2, 1, 3))?.contiguous()?;  // (batch, seq, heads, head_dim)
         let attn_output = attn_output.reshape((batch_size, seq_len, self.num_heads * self.head_dim))?;
-        
+
         // Output projection: reshape to 2D, matmul, reshape back
         let attn_2d = attn_output.reshape((batch_size * seq_len, self.num_heads * self.head_dim))?;
         let out = attn_2d.matmul(&self.out_proj.t()?)?;

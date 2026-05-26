@@ -26,6 +26,17 @@ use crate::metal_bert::{MetalBertConfig, MetalBertModel};
 use crate::nomic_bert::{NomicBertConfig, NomicBertModel};
 use crate::qwen2_embed::{Qwen2EmbedConfig, Qwen2EmbedModel};
 
+/// How to pool per-token embeddings into a single sentence vector.
+///
+/// Mirrors the `1_Pooling/config.json` modes used by sentence-transformers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolingStrategy {
+    /// Take the [CLS] token embedding (index 0) as the sentence representation.
+    Cls,
+    /// Mean over the sequence dimension, weighted by the attention mask.
+    Mean,
+}
+
 /// Supported model identifiers
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModelId {
@@ -123,6 +134,23 @@ impl ModelId {
         }
     }
 
+    /// Sentence-transformers `1_Pooling/config.json` strategy for this model.
+    ///
+    /// Verified against the published HF repos on 2026-05-25:
+    ///   - BAAI/bge-base-en-v1.5         : pooling_mode_cls_token=true  → CLS
+    ///   - sentence-transformers/MiniLM  : pooling_mode_mean_tokens=true → MEAN
+    ///   - thenlper/gte-base             : pooling_mode_mean_tokens=true → MEAN
+    /// Nomic and KaLM-V2 use their own pooling paths inside their backends.
+    pub fn pooling(&self) -> PoolingStrategy {
+        match self {
+            Self::BgeBase => PoolingStrategy::Cls,
+            Self::MiniLM => PoolingStrategy::Mean,
+            Self::GteBase => PoolingStrategy::Mean,
+            Self::Nomic => PoolingStrategy::Mean,
+            Self::KalmV2 => PoolingStrategy::Mean,
+        }
+    }
+
     /// All available models (does NOT include opt-in models like KalmV2)
     pub fn all() -> &'static [ModelId] {
         &[ModelId::BgeBase, ModelId::MiniLM, ModelId::GteBase, ModelId::Nomic]
@@ -132,6 +160,38 @@ impl ModelId {
     pub fn all_including_optional() -> &'static [ModelId] {
         &[ModelId::BgeBase, ModelId::MiniLM, ModelId::GteBase, ModelId::Nomic, ModelId::KalmV2]
     }
+
+    /// Whether this model is quarantined pending a correctness fix.
+    ///
+    /// Phase 1 fixture comparison vs sentence-transformers (2026-05-25, resolved):
+    ///   - minilm  : 0.999999 avg  ✅
+    ///   - bge-base: 0.999995 avg  ✅  (fixed: CLS pooling, commit e3ca17d)
+    ///   - gte-base: 0.999986 avg  ✅  (fixed: stale fixture regenerated with batch_size=1)
+    ///   - nomic   : 1.000000 avg  ✅  (was passing after prenorm revert 5e2f75c)
+    ///
+    /// All four models cleared the ≥0.999 threshold. No models are currently quarantined.
+    /// See tests/fixture_comparison.rs for the comparison harness.
+    pub fn quarantined(&self) -> bool {
+        false
+    }
+
+    /// One-line explanation of why a model is quarantined (for error messages).
+    /// Returns None for all models since none are currently quarantined.
+    pub fn quarantine_reason(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+/// Returns true if the operator has opted into quarantined models via env.
+/// Accepts `1`, `true`, `yes` (case-insensitive). Anything else (or unset) = false.
+pub fn quarantine_override_enabled() -> bool {
+    matches!(
+        std::env::var("ALLOW_QUARANTINED_MODELS")
+            .unwrap_or_default()
+            .to_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
 }
 
 impl std::fmt::Display for ModelId {
@@ -340,18 +400,21 @@ impl Embedder {
             }
         };
 
-        // Mean pooling over sequence length (with attention mask)
-        let pooled = self.mean_pooling(&embeddings, &attention_mask)?;
+        // Pool per-token outputs into a single sentence vector using the
+        // model-specific strategy (BGE = CLS, MiniLM/GTE/Nomic = mean).
+        let pooled = match self.model_id.pooling() {
+            PoolingStrategy::Cls => self.cls_pooling(&embeddings)?,
+            PoolingStrategy::Mean => self.mean_pooling(&embeddings, &attention_mask)?,
+        };
 
-        // Normalize if requested
+        // Normalize if requested — ensure pooled is contiguous before norm math
         let final_embeddings = if self.normalize {
-            self.normalize_l2(&pooled)?
+            self.normalize_l2(&pooled.contiguous()?)?
         } else {
             pooled
         };
 
-        // Convert to Vec<Vec<f32>>
-        let result = final_embeddings.to_vec2::<f32>()?;
+        let result = final_embeddings.contiguous()?.to_vec2::<f32>()?;
         validate_embedding_batch(&result, self.model_id)?;
         Ok(result)
     }
@@ -373,6 +436,15 @@ impl Embedder {
         let pooled = summed.broadcast_div(&mask_sum)?;
 
         Ok(pooled)
+    }
+
+    /// CLS pooling: take the first token (index 0) along the sequence dimension.
+    /// Matches sentence-transformers `pooling_mode_cls_token=true` (used by BGE).
+    fn cls_pooling(&self, embeddings: &Tensor) -> Result<Tensor> {
+        // embeddings: (batch, seq_len, hidden)
+        // Narrow to seq_len=1 starting at index 0, then squeeze.
+        let cls = embeddings.narrow(1, 0, 1)?.squeeze(1)?;
+        Ok(cls)
     }
 
     /// L2 normalize embeddings (unit vectors)
@@ -488,6 +560,26 @@ impl ModelRegistry {
                 model_id.display_name(),
                 self.enabled_models.iter().map(|m| m.display_name()).collect::<Vec<_>>()
             ));
+        }
+
+        // Quarantine gate: refuse known-broken models unless the operator has
+        // explicitly opted in via ALLOW_QUARANTINED_MODELS=true.
+        if model_id.quarantined() {
+            if quarantine_override_enabled() {
+                tracing::warn!(
+                    model = model_id.display_name(),
+                    reason = model_id.quarantine_reason().unwrap_or(""),
+                    "Loading QUARANTINED model — embeddings are KNOWN-INCORRECT. \
+                     ALLOW_QUARANTINED_MODELS override is active. Do not use in production."
+                );
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Model '{}' is quarantined pending correctness fix. {}. \
+                     To force-enable for debugging, set ALLOW_QUARANTINED_MODELS=true.",
+                    model_id.display_name(),
+                    model_id.quarantine_reason().unwrap_or("see tests/fixture_comparison.rs")
+                ));
+            }
         }
 
         // Load the model (may need to evict first)
@@ -1198,6 +1290,53 @@ mod tests {
     // ========================================================================
     // EmbedResult Tests
     // ========================================================================
+
+    // ========================================================================
+    // Quarantine Tests
+    // ========================================================================
+
+    #[test]
+    fn test_quarantined_flag_per_model() {
+        // All models cleared ≥0.999 fixture threshold — none are quarantined.
+        assert!(!ModelId::MiniLM.quarantined());
+        assert!(!ModelId::KalmV2.quarantined());
+        assert!(!ModelId::BgeBase.quarantined(), "bge-base cleared after CLS pooling fix");
+        assert!(!ModelId::GteBase.quarantined(), "gte-base cleared after fixture regen");
+        assert!(!ModelId::Nomic.quarantined(), "nomic cleared after prenorm revert");
+    }
+
+    #[test]
+    fn test_quarantine_reason_none_for_all_passing_models() {
+        // No models are quarantined; quarantine_reason() returns None for all.
+        assert!(ModelId::BgeBase.quarantine_reason().is_none());
+        assert!(ModelId::GteBase.quarantine_reason().is_none());
+        assert!(ModelId::Nomic.quarantine_reason().is_none());
+        assert!(ModelId::MiniLM.quarantine_reason().is_none());
+        assert!(ModelId::KalmV2.quarantine_reason().is_none());
+    }
+
+    #[test]
+    fn test_quarantine_override_helper_parses_truthy_values() {
+        let prior = std::env::var("ALLOW_QUARANTINED_MODELS").ok();
+
+        std::env::remove_var("ALLOW_QUARANTINED_MODELS");
+        assert!(!quarantine_override_enabled());
+
+        for v in ["true", "TRUE", "True", "1", "yes", "YES"] {
+            std::env::set_var("ALLOW_QUARANTINED_MODELS", v);
+            assert!(quarantine_override_enabled(), "{} should be truthy", v);
+        }
+
+        for v in ["", "0", "false", "no", "anything-else"] {
+            std::env::set_var("ALLOW_QUARANTINED_MODELS", v);
+            assert!(!quarantine_override_enabled(), "{} should be falsy", v);
+        }
+
+        match prior {
+            Some(v) => std::env::set_var("ALLOW_QUARANTINED_MODELS", v),
+            None => std::env::remove_var("ALLOW_QUARANTINED_MODELS"),
+        }
+    }
 
     #[test]
     fn test_embed_result_clone() {

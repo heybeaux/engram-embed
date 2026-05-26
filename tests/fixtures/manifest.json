@@ -1,0 +1,11 @@
+{
+  "generated_by": "scripts/fixture_gen.py",
+  "sentence_transformers_version": "5.5.1",
+  "num_texts": 20,
+  "models": [
+    "bge-base",
+    "minilm",
+    "gte-base",
+    "nomic"
+  ]
+}

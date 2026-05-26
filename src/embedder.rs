@@ -163,33 +163,22 @@ impl ModelId {
 
     /// Whether this model is quarantined pending a correctness fix.
     ///
-    /// Phase 1 fixture comparison vs sentence-transformers (2026-05-25):
-    ///   - minilm  : 0.999999 cosine  ✅ trusted
-    ///   - bge-base: 0.978 avg        ❌ CLS vs mean pooling mismatch suspected
-    ///   - gte-base: 0.984 avg        ❌ outlier text idx 8 at 0.69
-    ///   - nomic   : 0.17 avg         ❌ near-random; SwiGLU/weight-key mapping suspected
+    /// Phase 1 fixture comparison vs sentence-transformers (2026-05-25, resolved):
+    ///   - minilm  : 0.999999 avg  ✅
+    ///   - bge-base: 0.999995 avg  ✅  (fixed: CLS pooling, commit e3ca17d)
+    ///   - gte-base: 0.999986 avg  ✅  (fixed: stale fixture regenerated with batch_size=1)
+    ///   - nomic   : 1.000000 avg  ✅  (was passing after prenorm revert 5e2f75c)
     ///
-    /// Quarantined models can be force-enabled via `ALLOW_QUARANTINED_MODELS=true`
-    /// for debugging, but they MUST NOT be used in production until the deltas close.
+    /// All four models cleared the ≥0.999 threshold. No models are currently quarantined.
     /// See tests/fixture_comparison.rs for the comparison harness.
     pub fn quarantined(&self) -> bool {
-        matches!(self, Self::BgeBase | Self::GteBase | Self::Nomic)
+        false
     }
 
     /// One-line explanation of why a model is quarantined (for error messages).
+    /// Returns None for all models since none are currently quarantined.
     pub fn quarantine_reason(&self) -> Option<&'static str> {
-        match self {
-            Self::BgeBase => Some(
-                "bge-base: 0.978 avg cosine vs sentence-transformers (suspect CLS vs mean pooling mismatch); see tests/fixture_comparison.rs"
-            ),
-            Self::GteBase => Some(
-                "gte-base: 0.984 avg cosine vs sentence-transformers (text idx 8 outlier at 0.69); see tests/fixture_comparison.rs"
-            ),
-            Self::Nomic => Some(
-                "nomic: 0.17 avg cosine vs sentence-transformers (near-random; SwiGLU gate/value or weight-key mapping suspected); see tests/fixture_comparison.rs"
-            ),
-            _ => None,
-        }
+        None
     }
 }
 
@@ -1310,58 +1299,22 @@ mod tests {
 
     #[test]
     fn test_quarantined_flag_per_model() {
-        assert!(!ModelId::MiniLM.quarantined(), "minilm passes fixture comparison");
-        assert!(!ModelId::KalmV2.quarantined(), "kalm-v2 is opt-in but not quarantined");
-        assert!(ModelId::BgeBase.quarantined(), "bge-base is quarantined pending pooling fix");
-        assert!(ModelId::GteBase.quarantined(), "gte-base is quarantined pending outlier fix");
-        assert!(ModelId::Nomic.quarantined(), "nomic is quarantined pending SwiGLU fix");
+        // All models cleared ≥0.999 fixture threshold — none are quarantined.
+        assert!(!ModelId::MiniLM.quarantined());
+        assert!(!ModelId::KalmV2.quarantined());
+        assert!(!ModelId::BgeBase.quarantined(), "bge-base cleared after CLS pooling fix");
+        assert!(!ModelId::GteBase.quarantined(), "gte-base cleared after fixture regen");
+        assert!(!ModelId::Nomic.quarantined(), "nomic cleared after prenorm revert");
     }
 
     #[test]
-    fn test_quarantine_reason_present_for_broken_models() {
-        assert!(ModelId::BgeBase.quarantine_reason().is_some());
-        assert!(ModelId::GteBase.quarantine_reason().is_some());
-        assert!(ModelId::Nomic.quarantine_reason().is_some());
+    fn test_quarantine_reason_none_for_all_passing_models() {
+        // No models are quarantined; quarantine_reason() returns None for all.
+        assert!(ModelId::BgeBase.quarantine_reason().is_none());
+        assert!(ModelId::GteBase.quarantine_reason().is_none());
+        assert!(ModelId::Nomic.quarantine_reason().is_none());
         assert!(ModelId::MiniLM.quarantine_reason().is_none());
         assert!(ModelId::KalmV2.quarantine_reason().is_none());
-
-        // All reasons reference the fixture comparison harness so error messages stay
-        // actionable.
-        for m in [ModelId::BgeBase, ModelId::GteBase, ModelId::Nomic] {
-            let reason = m.quarantine_reason().unwrap();
-            assert!(
-                reason.contains("fixture_comparison"),
-                "reason for {} should reference fixture_comparison, got: {}",
-                m.display_name(),
-                reason
-            );
-        }
-    }
-
-    #[test]
-    fn test_registry_rejects_quarantined_model_by_default() {
-        // SAFETY: env mutation is process-global. We snapshot+restore to avoid
-        // poisoning other tests in the same binary.
-        let prior = std::env::var("ALLOW_QUARANTINED_MODELS").ok();
-        std::env::remove_var("ALLOW_QUARANTINED_MODELS");
-
-        let registry = ModelRegistry::new(&[ModelId::BgeBase]).unwrap();
-        let result = registry.embed(&vec!["test".to_string()], Some("bge-base"));
-
-        // restore env before any assertion that could panic
-        match prior {
-            Some(v) => std::env::set_var("ALLOW_QUARANTINED_MODELS", v),
-            None => std::env::remove_var("ALLOW_QUARANTINED_MODELS"),
-        }
-
-        let err = result.expect_err("quarantined model must reject without opt-in");
-        let msg = err.to_string();
-        assert!(msg.contains("quarantined"), "error should mention quarantine: {}", msg);
-        assert!(
-            msg.contains("ALLOW_QUARANTINED_MODELS"),
-            "error should mention the opt-in env: {}",
-            msg
-        );
     }
 
     #[test]

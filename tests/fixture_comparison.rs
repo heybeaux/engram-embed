@@ -196,3 +196,4 @@ fn test_all_models_fixture_comparison_report() {
         "One or more models failed cosine threshold — Phase 2 is blocked until fixed."
     );
 }
+

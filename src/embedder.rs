@@ -414,8 +414,6 @@ impl Embedder {
             pooled
         };
 
-        // Convert to Vec<Vec<f32>> — contiguous() ensures Metal/GPU tensor memory
-        // is fully resolved and laid out sequentially before host extraction.
         let result = final_embeddings.contiguous()?.to_vec2::<f32>()?;
         validate_embedding_batch(&result, self.model_id)?;
         Ok(result)

@@ -484,6 +484,21 @@ fn validate_embedding_batch(embeddings: &[Vec<f32>], model_id: ModelId) -> Resul
                 value
             ));
         }
+
+        // Guard against Metal GPU stalls that produce zero-filled buffers.
+        // A zero-norm vector is geometrically dead: all cosine similarities
+        // collapse to 0, causing silent recall failure. 0.0 is finite so
+        // the is_finite check above doesn't catch it.
+        let norm_sq: f32 = embedding.iter().map(|x| x * x).sum();
+        if norm_sq < 1e-12 {
+            return Err(anyhow!(
+                "invalid embedding at row {} for model {}: zero-norm vector (norm² = {:.2e}), \
+                 likely caused by a Metal GPU command-buffer stall",
+                row_idx,
+                model_id.display_name(),
+                norm_sq
+            ));
+        }
     }
 
     Ok(())
@@ -957,6 +972,38 @@ mod tests {
         let err = validate_embedding_batch(&embeddings, ModelId::BgeBase).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("expected 768 dimensions, got 767"));
+    }
+
+    #[test]
+    fn test_validate_embedding_batch_rejects_zero_vector() {
+        let embeddings = vec![vec![0.0f32; 768]];
+
+        let err = validate_embedding_batch(&embeddings, ModelId::BgeBase).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("zero-norm vector"), "expected zero-norm error, got: {msg}");
+        assert!(msg.contains("row 0"), "expected row index in error, got: {msg}");
+    }
+
+    #[test]
+    fn test_validate_embedding_batch_rejects_near_zero_vector() {
+        // norm² = 768 * (1e-7)² = 7.68e-12 < 1e-12 threshold? No — let's use a value that
+        // produces norm² well below 1e-12: single component at 1e-7 → norm² = 1e-14.
+        let mut embedding = vec![0.0f32; 768];
+        embedding[0] = 1e-7_f32;
+        let embeddings = vec![embedding];
+
+        let err = validate_embedding_batch(&embeddings, ModelId::BgeBase).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("zero-norm vector"), "expected zero-norm error, got: {msg}");
+    }
+
+    #[test]
+    fn test_validate_embedding_batch_accepts_normal_embedding() -> Result<()> {
+        // Simulate a realistic unit-normalised embedding (values ~1/sqrt(768) ≈ 0.036).
+        let val = 1.0_f32 / (768_f32).sqrt();
+        let embeddings = vec![vec![val; 768]];
+        validate_embedding_batch(&embeddings, ModelId::BgeBase)?;
+        Ok(())
     }
 
     #[test]

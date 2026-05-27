@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::signal;
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -134,6 +134,9 @@ struct ModelStatus {
 struct AppState {
     registry: ModelRegistry,
     metrics: Metrics,
+    /// Limits concurrent GPU inference calls to prevent Metal kernel saturation.
+    /// Default 4; configurable via EMBED_MAX_CONCURRENT env var.
+    inference_semaphore: Semaphore,
     #[allow(dead_code)]
     shutdown_rx: watch::Receiver<bool>,
 }
@@ -199,6 +202,26 @@ async fn embed(
 
     // Count tokens (rough approximation)
     let token_count: usize = texts.iter().map(|t| t.split_whitespace().count()).sum();
+
+    // Acquire inference permit — blocks if GPU concurrency cap is reached.
+    // 30s timeout returns 503 rather than queuing forever under pathological load.
+    let _permit = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        state.inference_semaphore.acquire(),
+    )
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Inference backlog timeout — try again shortly".to_string(),
+        )
+    })?
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Semaphore closed".to_string(),
+        )
+    })?;
 
     // Check if requesting all models
     if request.model == "*" || request.model == "all" {
@@ -421,17 +444,27 @@ async fn main() -> Result<()> {
 
     // Create registry (lazy loading - models loaded on first request)
     let registry = ModelRegistry::new(&model_ids)?;
-    
+
     // Create metrics
     let metrics = Metrics::new();
+
+    // Concurrency cap — prevents Metal GPU saturation under bulk-ingest load.
+    // Root cause of the May-23-2026 LongMemEval incident (22P02 from zero-norm vectors
+    // produced by stalled Metal kernels). PR #5 guards the symptom; this prevents it.
+    let max_concurrent: usize = std::env::var("EMBED_MAX_CONCURRENT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    info!(max_concurrent = max_concurrent, "Inference concurrency cap set (EMBED_MAX_CONCURRENT)");
 
     // Create shutdown channel
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     // Create app state
-    let state = Arc::new(AppState { 
-        registry, 
+    let state = Arc::new(AppState {
+        registry,
         metrics,
+        inference_semaphore: Semaphore::new(max_concurrent),
         shutdown_rx,
     });
 
